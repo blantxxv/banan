@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 set -e
 
-REPO="https://raw.githubusercontent.com/mahmudali1337-lab/torrent-blocker/master"
+REPO="https://raw.githubusercontent.com/blantxxv/banan/main"
 BINARY="/usr/local/bin/torrent-blocker"
 SERVICE="torrent-blocker"
 SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
 START_CMD="${BINARY} --log /var/log/remnanode/access.log --tag TORRENT --no-finwait-ban --ban-duration 10 --conn-thresh 300 --sendq-thresh 10 --finwait-thresh 30"
-GO_VERSION="1.26.5"
-GO_TAR="go${GO_VERSION}.linux-amd64.tar.gz"
-GO_URL="https://go.dev/dl/${GO_TAR}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
@@ -35,21 +32,14 @@ ok "Зависимости установлены"
 info "Загрузка модуля xt_string..."
 modprobe xt_string 2>/dev/null && ok "xt_string загружен" || warn "xt_string недоступен (DPI может не работать)"
 
-if command -v go &>/dev/null; then
-    GOINSTALLED=$(go version)
-    ok "Go уже установлен: ${GOINSTALLED}"
+if command -v go >/dev/null 2>&1; then
+    ok "Go уже установлен: $(go version)"
 else
-    info "Установка Go ${GO_VERSION}..."
-    cd /tmp
-    curl -fsSL "${GO_URL}" -o "${GO_TAR}"
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf "${GO_TAR}"
-    rm -f "${GO_TAR}"
-    export PATH=$PATH:/usr/local/go/bin
+    info "Установка Go через apt..."
+    apt-get install -y -qq golang-go
+    command -v go >/dev/null 2>&1 || fail "Не удалось установить Go"
     ok "Go установлен: $(go version)"
 fi
-
-export PATH=$PATH:/usr/local/go/bin
 
 info "Загрузка исходного кода..."
 TMPDIR=$(mktemp -d)
