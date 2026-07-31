@@ -6,7 +6,7 @@ BINARY="/usr/local/bin/torrent-blocker"
 SERVICE="torrent-blocker"
 SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
 START_CMD="${BINARY} --log /var/log/remnanode/access.log --tag TORRENT --no-finwait-ban --ban-duration 10 --conn-thresh 300 --sendq-thresh 10 --finwait-thresh 30"
-GO_VERSION="1.22.3"
+GO_VERSION="1.26.5"
 GO_TAR="go${GO_VERSION}.linux-amd64.tar.gz"
 GO_URL="https://go.dev/dl/${GO_TAR}"
 
