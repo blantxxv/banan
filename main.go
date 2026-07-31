@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"io/ioutil"
 	"os/exec"
 	"os/signal"
 	"strconv"
@@ -398,12 +399,12 @@ func saveStorage() {
 	blockedMu.Unlock()
 	os.MkdirAll("/var/lib/torrent-blocker", 0750)
 	tmp := storageFile + ".tmp"
-	os.WriteFile(tmp, data, 0640)
+	ioutil.WriteFile(tmp, data, 0640)
 	os.Rename(tmp, storageFile)
 }
 
 func loadStorage() {
-	data, err := os.ReadFile(storageFile)
+	data, err := ioutil.ReadFile(storageFile)
 	if err != nil {
 		return
 	}
