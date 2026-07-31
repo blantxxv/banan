@@ -1,0 +1,17 @@
+# Compiled binaries
+torrent-blocker
+torrent-blocker.exe
+deployer/torrent-blocker
+deployer/torrent-blocker.exe
+
+# Sensitive data
+ssh.txt
+deployer/ssh.txt
+
+# Go vendor
+vendor/
+
+# Editor
+.idea/
+.vscode/
+*.swp
