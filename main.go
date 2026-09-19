@@ -912,6 +912,22 @@ func startNetstatMonitor() {
 	log.Printf("netstat monitor started (finwait_thresh=%d)", finWaitThresh)
 }
 
+// sportSafe: правило по --sport (source-порт) можно ставить ТОЛЬКО для портов
+// ниже эфемерного диапазона (32768–60999). Иначе легитимный клиент или форвард,
+// у которого ОС выбрала случайный исходящий порт (напр. Transmission 51413),
+// попал бы под DROP по source-порту. По --dport такие порты блокировать можно.
+func sportSafe(port string) bool {
+	hi := port
+	if i := strings.IndexByte(port, ':'); i >= 0 {
+		hi = port[i+1:]
+	}
+	n, err := strconv.Atoi(hi)
+	if err != nil {
+		return false
+	}
+	return n < 32768
+}
+
 func applyPortBlock() int {
 	count := 0
 	for _, ipt := range []string{"iptables", "ip6tables"} {
@@ -923,6 +939,11 @@ func applyPortBlock() int {
 				for _, chain := range dpiHooks {
 					dir := "--dport"
 					if chain == "INPUT" {
+						// INPUT ловим по source-порту — только если он не
+						// эфемерный (иначе задели бы клиентов).
+						if !sportSafe(port) {
+							continue
+						}
 						dir = "--sport"
 					}
 					if exec.Command(ipt, "-A", chain, "-p", proto, dir, port, "-j", "DROP").Run() == nil {
@@ -934,14 +955,18 @@ func applyPortBlock() int {
 				if vpnPorts[port] {
 					continue
 				}
+				// --dport безопасен для любых портов: блокируем «хостинг» торрент-порта.
 				if exec.Command(ipt, "-A", "FORWARD", "-p", proto, "--dport", port, "-j", "DROP").Run() == nil {
 					count++
 				}
-				if exec.Command(ipt, "-A", "FORWARD", "-p", proto, "--sport", port, "-j", "DROP").Run() == nil {
-					count++
-				}
-				if exec.Command(ipt, "-A", "INPUT", "-p", proto, "--sport", port, "-j", "DROP").Run() == nil {
-					count++
+				// --sport только для неэфемерных портов, иначе рискуем клиентами.
+				if sportSafe(port) {
+					if exec.Command(ipt, "-A", "FORWARD", "-p", proto, "--sport", port, "-j", "DROP").Run() == nil {
+						count++
+					}
+					if exec.Command(ipt, "-A", "INPUT", "-p", proto, "--sport", port, "-j", "DROP").Run() == nil {
+						count++
+					}
 				}
 			}
 		}
