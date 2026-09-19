@@ -124,7 +124,7 @@ else
     ok "access.log: ${LOGPATH}"
 fi
 
-START_CMD="${BINARY} --log ${LOGPATH} --tag TORRENT --ban-duration 10 --bypass-file ${BYPASS_FILE}"
+START_CMD="${BINARY} --log ${LOGPATH} --tag TORRENT --no-netstat --no-finwait-ban --ban-duration 10 --bypass-file ${BYPASS_FILE}"
 
 info "Запись systemd unit-файла..."
 cat > "${SERVICE_FILE}" << EOF
