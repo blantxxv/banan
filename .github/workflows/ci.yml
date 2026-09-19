@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: go vet
+        run: |
+          go mod init torrent-blocker 2>/dev/null || true
+          go vet ./...
+      - name: go test
+        run: go test -v ./...
+      - name: build linux/amd64
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o torrent-blocker main.go
