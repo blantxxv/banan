@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
-	"io/ioutil"
 	"os/exec"
 	"os/signal"
 	"strconv"
@@ -31,23 +31,45 @@ var dpiHooks = []string{"OUTPUT", "FORWARD", "INPUT"}
 var banHooks = []string{"PREROUTING", "OUTPUT"}
 
 var (
-	banDuration   = 10 * time.Minute
-	peerBanDur    = 24 * time.Hour
-	logFile       = ""
-	torrentTag    = "TORRENT"
-	bypassIPs     = map[string]bool{"127.0.0.1": true, "::1": true}
-	enableNetstat = true
-	enableFinWait = true
+	banDuration = 10 * time.Minute
+	peerBanDur  = 24 * time.Hour
+	logFile     = ""
+	torrentTag  = "TORRENT"
+	// ⚠️ netstat-эвристики (шторм FIN_WAIT / много ESTABLISHED с большой
+	// send-queue) НЕ отличают торрент от моста/релея и банят свою же
+	// инфраструктуру. Поэтому по умолчанию ВЫКЛЮЧЕНЫ. Включать осознанно
+	// флагами --netstat / --finwait-ban только на нодах, через которые не
+	// ходят haproxy/sing-box мосты и релеи.
+	enableNetstat = false
+	enableFinWait = false
 	finWaitThresh = 30
 	connThresh    = 300
 	sendQThresh   = 10
-	vpnPorts      = map[string]bool{
-		"1194":  true,
-		"51820": true,
-		"500":   true,
-		"4500":  true,
-		"443":   true,
+	bypassFile    = "/etc/torrent-blocker/bypass.txt"
+	// Порты, которые НИКОГДА не трогаем: и DPI-цепочка их пропускает (RETURN),
+	// и блок портов их не блокирует. Сюда входят VPN-протоколы и все TLS-порты,
+	// на которых живут наши ноды/мосты/фронты/релеи (Reality, Hysteria2,
+	// haproxy, Cloudflare-совместимые). Торрент на этих портах почти не
+	// встречается — сохранность мостов важнее.
+	vpnPorts = map[string]bool{
+		"22":    true, // SSH — чтобы DPI никогда не отрезал управление
+		"53":    true, // DNS (домены-трекеры ловим отдельными правилами по dport 53)
 		"80":    true,
+		"443":   true,
+		"853":   true, // DoT
+		"500":   true,
+		"1194":  true,
+		"4500":  true,
+		"51820": true, // WireGuard
+		// TLS-порты нод/мостов/фронтов (см. haproxy/Reality/Hysteria2 на флоте)
+		"2053": true,
+		"2083": true,
+		"2087": true,
+		"2096": true,
+		"3443": true,
+		"4443": true,
+		"8080": true,
+		"8443": true,
 	}
 )
 
@@ -91,14 +113,23 @@ var signatures = []signature{
 	{proto: "udp", pattern: "1:q4:ping", action: "PEER"},
 	{proto: "udp", pattern: "1:q4:vote", action: "PEER"},
 	{proto: "udp", pattern: "1:q17:sample_infohashes", action: "PEER"},
-	{proto: "udp", pattern: "1:y1:q", action: "PEER"},
-	{proto: "udp", pattern: "1:y1:r", action: "PEER"},
+	{proto: "udp", pattern: "1:q3:put", action: "PEER"},       // BEP44 DHT store
+	{proto: "udp", pattern: "1:q3:get", action: "PEER"},       // BEP44 DHT read
+	{proto: "udp", pattern: "9:info_hash20:", action: "PEER"}, // аргумент get_peers/announce_peer
+	{proto: "udp", pattern: "1:y1:q", action: "PEER"},         // KRPC query
+	{proto: "udp", pattern: "1:y1:r", action: "PEER"},         // KRPC response
+	{proto: "udp", pattern: "1:y1:e", action: "PEER"},         // KRPC error
+	// Peer wire / extension protocol (BEP9/BEP10/BEP11) — .torrent-метаданные,
+	// PEX, обмен кусками. Проявляется на исходящем плече нода→пир открытым текстом.
 	{proto: "tcp", pattern: "13:piece length", action: "PEER"},
 	{proto: "tcp", pattern: "4:infod", action: "PEER"},
 	{proto: "tcp", pattern: "11:ut_metadata", action: "PEER"},
+	{proto: "tcp", pattern: "13:metadata_size", action: "PEER"},
 	{proto: "tcp", pattern: "5:ut_pex", action: "PEER"},
+	{proto: "tcp", pattern: "12:ut_holepunch", action: "PEER"},
 	{proto: "tcp", pattern: "upload_only", action: "PEER"},
 	{proto: "tcp", pattern: "lt_donthave", action: "PEER"},
+	// UDP-трекер (BEP15): connect-запрос всегда начинается с protocol_id 0x41727101980.
 	{proto: "udp", hex: "|0000041727101980|", action: "TRACKER"},
 	{proto: "tcp", pattern: "info_hash=", action: "TRACKER"},
 	{proto: "tcp", pattern: "peer_id=", action: "TRACKER"},
@@ -110,6 +141,13 @@ var signatures = []signature{
 	{proto: "tcp", pattern: "d8:announce", action: "TRACKER"},
 	{proto: "tcp", pattern: "d13:announce-list", action: "TRACKER"},
 	{proto: "tcp", pattern: "/announce HTTP", action: "TRACKER"},
+	{proto: "tcp", pattern: "/scrape HTTP", action: "TRACKER"},
+	// magnet-ссылки и info-hash в открытом HTTP (btih = BitTorrent Info Hash).
+	{proto: "tcp", pattern: "xt=urn:btih:", action: "DROP"},
+	{proto: "tcp", pattern: "urn:btih:", action: "DROP"},
+	{proto: "tcp", pattern: "urn:btmh:", action: "DROP"}, // BitTorrent v2 multihash
+	// Local Service Discovery (BEP14) — мультикаст-анонс пиров в локальной сети.
+	{proto: "udp", pattern: "BT-SEARCH * HTTP/1.1", action: "DROP"},
 	{proto: "tcp", pattern: "User-Agent: uTorrent", action: "DROP"},
 	{proto: "tcp", pattern: "User-Agent: BitTorrent", action: "DROP"},
 	{proto: "tcp", pattern: "User-Agent: qBittorrent", action: "DROP"},
@@ -121,6 +159,13 @@ var signatures = []signature{
 	{proto: "tcp", pattern: "User-Agent: Aria2", action: "DROP"},
 	{proto: "tcp", pattern: "User-Agent: WebTorrent", action: "DROP"},
 	{proto: "tcp", pattern: "User-Agent: Tixati", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: BiglyBT", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: BitComet", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: BitLord", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: KTorrent", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: rtorrent", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: Folx", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: FrostWire", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "router.bittorrent.com", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "router.utorrent.com", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "dht.transmissionbt.com", action: "DROP"},
@@ -130,20 +175,32 @@ var signatures = []signature{
 	{proto: "udp", dport: 53, pattern: "rutor", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "thepiratebay", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "1337x", action: "DROP"},
+	{proto: "udp", dport: 53, pattern: "dht.libtorrent.org", action: "DROP"},
+	{proto: "udp", dport: 53, pattern: "router.bitcomet.com", action: "DROP"},
+	{proto: "udp", dport: 53, pattern: "dht.aelitis.com", action: "DROP"},
 	{proto: "tcp", dport: 53, pattern: "router.bittorrent.com", action: "DROP"},
 	{proto: "tcp", dport: 53, pattern: "router.utorrent.com", action: "DROP"},
 	{proto: "tcp", dport: 53, pattern: "dht.transmissionbt.com", action: "DROP"},
+	{proto: "tcp", dport: 53, pattern: "dht.libtorrent.org", action: "DROP"},
+	{proto: "tcp", dport: 53, pattern: "router.bitcomet.com", action: "DROP"},
+	{proto: "tcp", dport: 53, pattern: "dht.aelitis.com", action: "DROP"},
 }
 
+// Порты трекеров и служебные P2P-порты. Блокируются на OUTPUT/FORWARD/INPUT,
+// но НЕ трогаются, если попали в vpnPorts. Все значения — заведомо ниже
+// эфемерного диапазона Linux (32768–60999), поэтому блок по --sport не задевает
+// исходящие соединения нод/мостов.
 var trackerPorts = []string{
-	"6969", "2710", "1337",
-	"4662", "4661", "4672", "4665",
+	"6969", "2710", "1337", // popular UDP/HTTP tracker ports
+	"6771",                         // Local Service Discovery (BEP14)
+	"4662", "4661", "4672", "4665", // eDonkey/eMule
 	"411", "412", "1214", "4242",
 	"8999", "3659",
 }
 
+// Стандартные порты BitTorrent-клиентов (диапазон входящих подключений пиров).
 var clientPorts = []string{
-	"6881:6999", "6880", "51413",
+	"6881:6999", "6880", "51413", // BitTorrent mainline / Transmission
 }
 
 var torrentDestDomains = []string{
@@ -203,6 +260,123 @@ var bypassDomains = []string{
 	"appsflyer.com", "adjust.com", "amplitude.com",
 	"ekatox.com", "ekatox-ru.com",
 	"smartcallback.ru",
+}
+
+// ── Белый список (защита своей инфраструктуры) ──────────────────────────────
+//
+// bypassIPs   — точные адреса (мосты, релеи, панель, свой egress, SSH-клиент).
+// bypassNets  — CIDR-подсети из --bypass-net и файла bypass.txt.
+// Плюс к ним isProtectedIP всегда пропускает приватные/служебные диапазоны
+// (RFC1918, CGNAT 100.64/10, loopback, link-local, ULA), чтобы блокер никогда
+// не банил docker-мост, внутренний релей или собственные адреса ноды.
+var (
+	bypassMu   sync.RWMutex
+	bypassIPs  = map[string]bool{"127.0.0.1": true, "::1": true}
+	bypassNets []*net.IPNet
+)
+
+func addBypassIP(ip string) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return
+	}
+	if _, cidr, err := net.ParseCIDR(ip); err == nil {
+		bypassMu.Lock()
+		bypassNets = append(bypassNets, cidr)
+		bypassMu.Unlock()
+		return
+	}
+	bypassMu.Lock()
+	bypassIPs[ip] = true
+	bypassMu.Unlock()
+}
+
+// isProtectedIP — единственная точка решения «можно ли банить этот IP».
+// Возвращает true, если адрес трогать НЕЛЬЗЯ.
+func isProtectedIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return true // не смогли распарсить — на всякий случай не баним
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		switch {
+		case ip4[0] == 10,
+			ip4[0] == 172 && ip4[1]&0xf0 == 16, // 172.16.0.0/12
+			ip4[0] == 192 && ip4[1] == 168,     // 192.168.0.0/16
+			ip4[0] == 100 && ip4[1]&0xc0 == 64, // 100.64.0.0/10 (CGNAT)
+			ip4[0] == 169 && ip4[1] == 254,     // link-local
+			ip4[0] == 127:
+			return true
+		}
+	} else if ip[0]&0xfe == 0xfc { // fc00::/7 (ULA)
+		return true
+	}
+	bypassMu.RLock()
+	defer bypassMu.RUnlock()
+	if bypassIPs[ipStr] {
+		return true
+	}
+	for _, n := range bypassNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// addLocalIPs заносит все адреса интерфейсов ноды в белый список, чтобы блокер
+// никогда не забанил собственный egress/relay-адрес сервера.
+func addLocalIPs() {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return
+	}
+	n := 0
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			addBypassIP(ipn.IP.String())
+			n++
+		}
+	}
+	if n > 0 {
+		log.Printf("bypass: добавлено %d локальных адресов ноды", n)
+	}
+}
+
+// loadBypassFile читает bypass.txt (по одному IP или CIDR на строку, '#' —
+// комментарий). Вызывается на старте и по SIGHUP — можно дописать мост/релей
+// без перезапуска сервиса.
+func loadBypassFile(path string) {
+	if path == "" {
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	// Пользовательские CIDR пересобираем заново (для чистого перечтения по SIGHUP).
+	bypassMu.Lock()
+	bypassNets = nil
+	bypassMu.Unlock()
+	n := 0
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if i := strings.IndexByte(line, '#'); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if line == "" {
+			continue
+		}
+		addBypassIP(line)
+		n++
+	}
+	log.Printf("bypass: из %s загружено записей: %d", path, n)
 }
 
 func iptcmd(ip string) string {
@@ -329,7 +503,7 @@ func initPeerChain() {
 }
 
 func blockPeer(ip, reason string) {
-	if bypassIPs[ip] {
+	if isProtectedIP(ip) {
 		return
 	}
 	peerMu.Lock()
@@ -347,7 +521,7 @@ func blockPeer(ip, reason string) {
 }
 
 func banIP(ip, reason string) {
-	if bypassIPs[ip] {
+	if isProtectedIP(ip) {
 		return
 	}
 	blockedMu.Lock()
@@ -584,7 +758,7 @@ func monitorLog(path string) {
 			dest := extractDestFromLine(line)
 			if dest != "" && isDomainTorrent(dest) {
 				cip := extractClientIPFromLine(line)
-				if cip != "" && !bypassIPs[cip] {
+				if cip != "" && !isProtectedIP(cip) {
 					log.Printf("DOMAIN_TORRENT ban %s (dest=%s)", cip, dest)
 					banIP(cip, "domain_torrent:"+dest)
 				}
@@ -592,7 +766,7 @@ func monitorLog(path string) {
 			continue
 		}
 
-		if clientIP != "" && !bypassIPs[clientIP] {
+		if clientIP != "" && !isProtectedIP(clientIP) {
 			reason := "xray_tag:" + torrentTag
 			if email != "" {
 				reason += " user:" + email
@@ -607,7 +781,7 @@ func monitorLog(path string) {
 			d := strings.TrimPrefix(destAddr, "tcp:")
 			d = strings.TrimPrefix(d, "udp:")
 			destIP, _, err := net.SplitHostPort(d)
-			if err == nil && net.ParseIP(destIP) != nil && !bypassIPs[destIP] {
+			if err == nil && net.ParseIP(destIP) != nil && !isProtectedIP(destIP) {
 				blockPeer(destIP, "xray_dest:"+torrentTag)
 			}
 		}
@@ -683,7 +857,7 @@ func analyzeConnections(entries []connEntry) {
 	largeSendQ := map[string]int{}
 
 	for _, e := range entries {
-		if e.remoteIP == "" || bypassIPs[e.remoteIP] {
+		if e.remoteIP == "" || isProtectedIP(e.remoteIP) {
 			continue
 		}
 		if e.state == "FIN_WAIT1" || e.state == "FIN_WAIT2" {
@@ -967,10 +1141,23 @@ func main() {
 				i++
 			}
 		case "--bypass":
+			// принимает и одиночные IP, и CIDR-подсети (мосты/релеи/панель)
 			if i+1 < len(os.Args) {
 				for _, ip := range strings.Split(os.Args[i+1], ",") {
-					bypassIPs[strings.TrimSpace(ip)] = true
+					addBypassIP(ip)
 				}
+				i++
+			}
+		case "--bypass-net":
+			if i+1 < len(os.Args) {
+				for _, n := range strings.Split(os.Args[i+1], ",") {
+					addBypassIP(n)
+				}
+				i++
+			}
+		case "--bypass-file":
+			if i+1 < len(os.Args) {
+				bypassFile = os.Args[i+1]
 				i++
 			}
 		case "--vpn-port":
@@ -983,7 +1170,13 @@ func main() {
 				}
 				i++
 			}
+		case "--netstat":
+			// осознанное включение эвристик по числу соединений (см. предупреждение выше)
+			enableNetstat = true
+		case "--finwait-ban":
+			enableFinWait = true
 		case "--no-netstat":
+			// оставлено для совместимости: netstat и так выключен по умолчанию
 			enableNetstat = false
 		case "--no-finwait-ban":
 			enableFinWait = false
@@ -1042,6 +1235,12 @@ func main() {
 		return
 	}
 
+	// Собираем белый список ДО старта мониторов: свои адреса ноды + постоянный
+	// файл мостов/релеев. Без этого netstat-эвристики (если их включат) и даже
+	// разбор логов могли бы задеть свою инфраструктуру.
+	addLocalIPs()
+	loadBypassFile(bypassFile)
+
 	cleanup()
 	initBanChain()
 	initPeerChain()
@@ -1056,17 +1255,27 @@ func main() {
 	if logFile != "" {
 		fmt.Printf("monitoring log: %s (tag=%s)\n", logFile, torrentTag)
 	}
-	fmt.Printf("netstat=%v finwait_thresh=%d conn_thresh=%d sendq_thresh=%d\n",
-		enableNetstat, finWaitThresh, connThresh, sendQThresh)
+	if enableNetstat {
+		fmt.Printf("⚠️  netstat=ON finwait_ban=%v finwait_thresh=%d conn_thresh=%d sendq_thresh=%d — риск ложных банов мостов\n",
+			enableFinWait, finWaitThresh, connThresh, sendQThresh)
+	} else {
+		fmt.Printf("netstat=OFF (банится только реальный торрент: тег %s + DPI); bypass-file=%s\n",
+			torrentTag, bypassFile)
+	}
 
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-sig:
+		case s := <-sig:
+			if s == syscall.SIGHUP {
+				// перечитать белый список без перезапуска (добавили мост/релей)
+				loadBypassFile(bypassFile)
+				continue
+			}
 			cleanup()
 			fmt.Println("\ntorrent blocker stopped")
 			return

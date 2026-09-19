@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	installURL  = "https://raw.githubusercontent.com/mahmudali1337-lab/torrent-blocker/master/install.sh"
+	installURL  = "https://raw.githubusercontent.com/blantxxv/banan/main/install.sh"
 	serviceName = "torrent-blocker"
 )
 

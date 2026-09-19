@@ -19,7 +19,8 @@ const (
 	remoteBin   = "/usr/local/bin/torrent-blocker"
 	serviceName = "torrent-blocker"
 	serviceFile = "/etc/systemd/system/torrent-blocker.service"
-	startCmd    = "/usr/local/bin/torrent-blocker --log /var/log/remnanode/access.log --tag TORRENT"
+	// netstat-эвристики не включаем (банят мосты); белый список — bypass-file.
+	startCmd = "/usr/local/bin/torrent-blocker --log /var/log/remnanode/access.log --tag TORRENT --ban-duration 10 --bypass-file /etc/torrent-blocker/bypass.txt"
 )
 
 var serviceUnit = `[Unit]
@@ -29,6 +30,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=` + startCmd + `
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
 StandardOutput=journal

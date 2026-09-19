@@ -5,7 +5,9 @@ REPO="https://raw.githubusercontent.com/blantxxv/banan/main"
 BINARY="/usr/local/bin/torrent-blocker"
 SERVICE="torrent-blocker"
 SERVICE_FILE="/etc/systemd/system/${SERVICE}.service"
-START_CMD="${BINARY} --log /var/log/remnanode/access.log --tag TORRENT --no-finwait-ban --ban-duration 10 --conn-thresh 300 --sendq-thresh 10 --finwait-thresh 30"
+BYPASS_FILE="/etc/torrent-blocker/bypass.txt"
+# START_CMD собирается ниже, после того как определим реальный путь к access.log.
+# netstat-эвристики НЕ включаем: они банят мосты/релеи (см. bypass.txt).
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
@@ -64,6 +66,61 @@ chmod 750 /var/lib/torrent-blocker
 rm -f /var/lib/torrent-blocker/blocked.json
 ok "/var/lib/torrent-blocker создан (старое состояние очищено)"
 
+# ── Белый список: чтобы блокер НИКОГДА не отрезал наши мосты/релеи/панель ────
+info "Настройка белого списка ${BYPASS_FILE}..."
+mkdir -p "$(dirname "${BYPASS_FILE}")"
+if [ ! -f "${BYPASS_FILE}" ]; then
+    cat > "${BYPASS_FILE}" << 'EOB'
+# torrent-blocker: белый список. По одному IP или CIDR на строку, '#' — комментарий.
+# Сюда вносим ВСЁ своё, что не должно попасть под бан:
+#   - haproxy-мосты и sing-box мосты
+#   - релеи (напр. 89.223.124.211) и DNAT-воронки (напр. 201.10.79.0/24)
+#   - адреса панели
+# Приватные диапазоны (10/8, 172.16/12, 192.168/16, 100.64/10), loopback,
+# link-local и адреса самой ноды защищены в коде и сюда добавлять не нужно.
+# После правок: systemctl reload torrent-blocker (перечитает без простоя).
+EOB
+    chmod 600 "${BYPASS_FILE}"
+    ok "Создан шаблон ${BYPASS_FILE}"
+else
+    ok "Белый список уже существует, не трогаю: ${BYPASS_FILE}"
+fi
+
+# Автоматически добавляем IP того, кто сейчас по SSH — чтобы деплой не отрезал админа.
+SSH_IP="$(echo "${SSH_CONNECTION}" | awk '{print $1}')"
+if [ -n "${SSH_IP}" ] && ! grep -qxF "${SSH_IP}" "${BYPASS_FILE}" 2>/dev/null; then
+    echo "${SSH_IP}    # SSH-клиент (добавлено установщиком)" >> "${BYPASS_FILE}"
+    ok "В белый список добавлен SSH-клиент: ${SSH_IP}"
+fi
+
+# ── Определяем реальный путь к access.log xray ──────────────────────────────
+# Вендорский дефолт /var/log/remnanode/access.log — это путь ВНУТРИ контейнера;
+# на хосте лог лежит в <папке ноды>/logs/access.log (compose монтирует ./logs).
+# С неверным путём блокер слеп. Ищем реально существующий файл.
+info "Поиск access.log xray на хосте..."
+LOGPATH=""
+for cand in \
+    /var/log/remnanode/access.log \
+    /opt/remnanode/logs/access.log \
+    /root/remnanode/logs/access.log \
+    /home/ubuntu/remnanode/logs/access.log \
+    /home/*/remnanode/logs/access.log ; do
+    if [ -f "${cand}" ]; then LOGPATH="${cand}"; break; fi
+done
+if [ -z "${LOGPATH}" ]; then
+    FOUND="$(find /opt /root /home /var/log -maxdepth 4 -type f -name access.log -path '*remnanode*' 2>/dev/null | head -1)"
+    [ -n "${FOUND}" ] && LOGPATH="${FOUND}"
+fi
+if [ -z "${LOGPATH}" ]; then
+    LOGPATH="/var/log/remnanode/access.log"
+    warn "access.log не найден на хосте — ставлю дефолт ${LOGPATH}."
+    warn "Проверь, что в конфиге ноды включён лог доступа, и поправь ExecStart при необходимости."
+else
+    ok "access.log: ${LOGPATH}"
+fi
+
+START_CMD="${BINARY} --log ${LOGPATH} --tag TORRENT --ban-duration 10 --bypass-file ${BYPASS_FILE}"
+
 info "Запись systemd unit-файла..."
 cat > "${SERVICE_FILE}" << EOF
 [Unit]
@@ -73,6 +130,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=${START_CMD}
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
 StandardOutput=journal
