@@ -3,17 +3,42 @@
 Блокировщик торрент-трафика для Linux на базе iptables/ipset/DPI.  
 Работает совместно с [Xray](https://github.com/XTLS/Xray-core) / [Remnawave](https://github.com/remnawave/remnanode).
 
+## Слои защиты
+
+Торрент нельзя надёжно вырезать одним методом (есть шифрованный BT/uTP на 443).
+Поэтому — эшелонированно, каждый слой затыкает дыру другого:
+
+| Слой | Что | Механизм | Ставится |
+|------|-----|----------|----------|
+| **0** | правило роутинга xray | `sniffing` protocol `bittorrent` → **blackhole**/тег TORRENT | в панели Remnawave (не тут) |
+| **A** | nDPI (`xt_ndpi`) | ядровый inline-DROP bittorrent на egress | `install.sh --with-ndpi` / `install-ndpi.sh` |
+| **B** | Go-демон (`main.go`) | бан клиента по тегу TORRENT в access.log + свой DPI (`-m string`) + порты трекеров/пиров | `install.sh` (по умолчанию) |
+
+Слой 0 — самый надёжный (бьёт сам P2P на любом порту), но живёт в конфиге профиля.
+Если у профиля `bittorrent → direct/freedom`, торрент **разрешён** — сначала чинить это.
+
 ## Структура
 
 ```
-main.go          — демон блокировки (запускается на серверах)
+main.go            — демон слоя B (запускается на серверах)
+install.sh         — установщик слоя B (сборка на ноде); --with-ndpi добавляет слой A
+install-ndpi.sh    — установщик слоя A (xt_ndpi + DKMS + self-heal)
 deployer/
-  main.go        — скрипт массового деплоя на серверы по SSH
+  main.go          — массовый деплой по SSH (запускает install.sh)
   go.mod / go.sum
-ssh.txt.example  — пример файла серверов
+ssh.txt.example    — пример файла серверов
 ```
 
-## Запуск блокировщика вручную
+## Установка (одна командой на ноде)
+
+```bash
+# только слой B (Go):
+curl -fsSL https://raw.githubusercontent.com/blantxxv/banan/main/install.sh | bash
+# слой B + слой A (nDPI):
+curl -fsSL https://raw.githubusercontent.com/blantxxv/banan/main/install.sh | bash -s -- --with-ndpi
+```
+
+## Запуск слоя B вручную
 
 ```bash
 go build -o main main.go

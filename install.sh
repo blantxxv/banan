@@ -9,6 +9,11 @@ BYPASS_FILE="/etc/torrent-blocker/bypass.txt"
 # START_CMD собирается ниже, после того как определим реальный путь к access.log.
 # netstat-эвристики НЕ включаем: они банят мосты/релеи (см. bypass.txt).
 
+# --with-ndpi: дополнительно поставить слой A (ядровый xt_ndpi). По умолчанию
+# ставится только слой B (Go). Слой A требует сборки модуля ядра (не на всех).
+WITH_NDPI=0
+for _a in "$@"; do [ "$_a" = "--with-ndpi" ] && WITH_NDPI=1; done
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
 info() { echo -e "${CYAN}[*]${NC}  $*"; }
@@ -168,13 +173,33 @@ iptables -t raw -L TORRENT_BAN -n 2>/dev/null | head -5 || true
 cd /
 rm -rf "${TMPDIR}"
 
+# ── Слой A (nDPI), опционально ──────────────────────────────────────────────
+if [ "${WITH_NDPI}" = "1" ]; then
+    echo
+    info "Ставлю слой A (nDPI, ядровый DROP bittorrent)..."
+    NDPI_TMP="$(mktemp)"
+    if curl -fsSL "${REPO}/install-ndpi.sh" -o "${NDPI_TMP}"; then
+        # не валим весь установщик, если модуль ядра не собрался (слой B уже стоит)
+        if bash "${NDPI_TMP}"; then ok "Слой A (nDPI) установлен"; else warn "Слой A (nDPI) не встал на этом ядре — работает только слой B (это нормально для LXC/части ядер)"; fi
+    else
+        warn "Не смог скачать install-ndpi.sh — слой A пропущен"
+    fi
+    rm -f "${NDPI_TMP}"
+fi
+
 echo
 echo -e "${GREEN}══════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Установка завершена успешно!${NC}"
 echo -e "${GREEN}══════════════════════════════════════════════${NC}"
 echo
-echo -e "  Статус:   ${CYAN}systemctl status ${SERVICE}${NC}"
-echo -e "  Журнал:   ${CYAN}journalctl -u ${SERVICE} -f${NC}"
-echo -e "  Стоп:     ${CYAN}${BINARY} stop${NC}"
-echo -e "  Статистика: ${CYAN}${BINARY} status${NC}"
+echo -e "  Слой B (Go):"
+echo -e "    Статус:     ${CYAN}systemctl status ${SERVICE}${NC}"
+echo -e "    Журнал:     ${CYAN}journalctl -u ${SERVICE} -f${NC}"
+echo -e "    Стоп:       ${CYAN}${BINARY} stop${NC}"
+echo -e "    Статистика: ${CYAN}${BINARY} status${NC}"
+echo -e "    Белый список: ${CYAN}${BYPASS_FILE}${NC}  (правка → ${CYAN}systemctl reload ${SERVICE}${NC})"
+if [ "${WITH_NDPI}" = "1" ]; then
+    echo -e "  Слой A (nDPI):"
+    echo -e "    Статус:     ${CYAN}bash install-ndpi.sh --status${NC}  (или ${CYAN}systemctl status tb-ndpi.timer${NC})"
+fi
 echo
