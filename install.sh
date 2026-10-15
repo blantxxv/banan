@@ -39,7 +39,13 @@ ok "Зависимости установлены"
 info "Загрузка модуля xt_string..."
 modprobe xt_string 2>/dev/null && ok "xt_string загружен" || warn "xt_string недоступен (DPI может не работать)"
 
-if command -v go >/dev/null 2>&1; then
+# TB_BIN=<путь>: поставить готовый бинарь (флот-раскатка одной проверенной
+# сборкой) — без Go и сборки на ноде.
+if [ -n "${TB_BIN:-}" ]; then
+    [ -x "${TB_BIN}" ] || fail "TB_BIN=${TB_BIN} не найден или не исполняемый"
+    TMPDIR=$(mktemp -d); cp "${TB_BIN}" "${TMPDIR}/torrent-blocker"; cd "${TMPDIR}"
+    ok "Готовый бинарник: ${TB_BIN} ($(sha256sum "${TB_BIN}" | cut -c1-12))"
+elif command -v go >/dev/null 2>&1; then
     ok "Go уже установлен: $(go version)"
 else
     info "Установка Go через apt..."
@@ -48,16 +54,18 @@ else
     ok "Go установлен: $(go version)"
 fi
 
-info "Загрузка исходного кода..."
-TMPDIR=$(mktemp -d)
-curl -fsSL "${REPO}/main.go" -o "${TMPDIR}/main.go"
-ok "main.go скачан в ${TMPDIR}/main.go"
+if [ -z "${TB_BIN:-}" ]; then
+    info "Загрузка исходного кода..."
+    TMPDIR=$(mktemp -d)
+    curl -fsSL "${REPO}/main.go" -o "${TMPDIR}/main.go"
+    ok "main.go скачан в ${TMPDIR}/main.go"
 
-info "Сборка бинарника (linux/amd64)..."
-cd "${TMPDIR}"
-go mod init torrent-blocker 2>/dev/null || true
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o torrent-blocker main.go
-ok "Бинарник собран: $(du -sh torrent-blocker | cut -f1)"
+    info "Сборка бинарника (linux/amd64)..."
+    cd "${TMPDIR}"
+    go mod init torrent-blocker 2>/dev/null || true
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o torrent-blocker main.go
+    ok "Бинарник собран: $(du -sh torrent-blocker | cut -f1)"
+fi
 
 info "Установка бинарника в ${BINARY}..."
 systemctl stop "${SERVICE}" 2>/dev/null || true
