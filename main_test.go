@@ -242,3 +242,40 @@ func TestXrayLogParse(t *testing.T) {
 		t.Errorf("доменный путь не поймал rutracker.org (dest=%q)", d)
 	}
 }
+
+// Переход в DPI должен стоять первым: иначе ufw/docker принимают трафик раньше.
+func TestDPIHookFirst(t *testing.T) {
+	first := "-P OUTPUT ACCEPT\n-A OUTPUT -j TORRENT_DPI\n-A OUTPUT -j ufw-before-output\n"
+	if !dpiHookFirst(first, "OUTPUT") {
+		t.Error("наш переход первым — должно быть true")
+	}
+	late := "-P FORWARD ACCEPT\n-A FORWARD -j DOCKER-USER\n-A FORWARD -j DOCKER-FORWARD\n-A FORWARD -j TORRENT_DPI\n"
+	if dpiHookFirst(late, "FORWARD") {
+		t.Error("переход после DOCKER-FORWARD — должно быть false (DPI не видит bridge-контейнеры)")
+	}
+	if dpiHookFirst("-P INPUT ACCEPT\n", "INPUT") {
+		t.Error("пустая цепочка — перехода нет")
+	}
+}
+
+// Сигнатуры обязаны видеть полезную нагрузку TCP (первые килобайты потока),
+// а не только SYN; uTP SYN режется по незашифрованному заголовку.
+func TestDPIInspectsPayloadAndUTP(t *testing.T) {
+	cb := strings.Join(connbytesSkipArgs(), " ")
+	if !strings.Contains(cb, "--connbytes "+strconv.Itoa(dpiInspectBytes+1)+":") || !strings.Contains(cb, "-j RETURN") {
+		t.Errorf("connbytes-правило: %s", cb)
+	}
+	rules := utpSynRules()
+	if len(rules) != 2 || rules[0][0] != "iptables" || rules[1][0] != "ip6tables" {
+		t.Fatalf("ожидались v4+v6 правила uTP, есть %v", rules)
+	}
+	v4 := strings.Join(rules[0], " ")
+	for _, want := range []string{"--ctstate NEW", "--length 48", "0>>22&0x3C@8>>24=0x41", "-j DROP"} {
+		if !strings.Contains(v4, want) {
+			t.Errorf("uTP v4 без %q: %s", want, v4)
+		}
+	}
+	if !strings.Contains(strings.Join(rules[1], " "), "--length 68") {
+		t.Error("uTP v6: длина 40+8+20=68")
+	}
+}

@@ -974,6 +974,9 @@ func applyPortBlock() int {
 }
 
 func applyDPI() int {
+	// connbytes без учёта conntrack видит 0 байт → через сигнатуры шёл бы ВЕСЬ трафик.
+	exec.Command("sysctl", "-qw", "net.netfilter.nf_conntrack_acct=1").Run()
+	os.WriteFile("/etc/sysctl.d/90-torrent-blocker.conf", []byte("net.netfilter.nf_conntrack_acct=1\n"), 0644)
 	for _, ipt := range []string{"iptables", "ip6tables"} {
 		exec.Command(ipt, "-N", dpiChain).Run()
 		exec.Command(ipt, "-N", "CATCH_TRACKER").Run()
@@ -989,7 +992,15 @@ func applyDPI() int {
 
 		exec.Command(ipt, "-A", dpiChain, "-i", "lo", "-j", "RETURN").Run()
 		exec.Command(ipt, "-A", dpiChain, "-o", "lo", "-j", "RETURN").Run()
-		exec.Command(ipt, "-A", dpiChain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN").Run()
+		// ⚠️ Раньше здесь был RETURN для всего ESTABLISHED — сигнатуры видели только
+		// первый пакет потока, а у TCP это пустой SYN: рукопожатие BT, announce и
+		// info_hash не матчились НИКОГДА (на starry 0 срабатываний за месяц).
+		// Теперь проверяем первые dpiInspectBytes каждого потока (connbytes), дальше
+		// RETURN — дёшево и ловит полезную нагрузку TCP. Без connbytes — старый фолбэк.
+		if exec.Command(ipt, connbytesSkipArgs()...).Run() != nil {
+			log.Printf("%s: connbytes недоступен — DPI видит только первый пакет потока", ipt)
+			exec.Command(ipt, "-A", dpiChain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN").Run()
+		}
 		for port := range vpnPorts {
 			for _, proto := range []string{"tcp", "udp"} {
 				exec.Command(ipt, "-A", dpiChain, "-p", proto, "--dport", port, "-j", "RETURN").Run()
@@ -999,6 +1010,11 @@ func applyDPI() int {
 	}
 
 	count := 0
+	for _, r := range utpSynRules() {
+		if exec.Command(r[0], r[1:]...).Run() == nil {
+			count++
+		}
+	}
 	for _, sig := range signatures {
 		protos := []string{"tcp", "udp"}
 		if sig.proto != "" {
@@ -1029,12 +1045,63 @@ func applyDPI() int {
 			}
 		}
 	}
+	ensureDPIHooks()
+	return count
+}
+
+// Сколько байт каждого потока (в обе стороны) прогоняется через сигнатуры.
+const dpiInspectBytes = 4096
+
+func connbytesSkipArgs() []string {
+	return []string{"-A", dpiChain, "-m", "connbytes", "--connbytes", strconv.Itoa(dpiInspectBytes+1) + ":",
+		"--connbytes-dir", "both", "--connbytes-mode", "bytes", "-j", "RETURN"}
+}
+
+// uTP (BEP29) идёт поверх UDP, и его 20-байтный заголовок НЕ шифруется даже
+// при включённом MSE. ST_SYN без расширений = ровно 20 байт полезной нагрузки
+// с первым байтом 0x41 (type 4, ver 1). QUIC short-header (тоже 0x4x) не бывает
+// первым пакетом потока, DNS/443 уже отпущены RETURN выше. Режем установку
+// uTP-соединения с пиром — без него libtorrent/qBittorrent теряют основной транспорт.
+func utpSynRules() [][]string {
+	return [][]string{
+		{"iptables", "-A", dpiChain, "-p", "udp", "-m", "conntrack", "--ctstate", "NEW",
+			"-m", "length", "--length", "48", "-m", "u32", "--u32", "0>>22&0x3C@8>>24=0x41", "-j", "DROP"},
+		{"ip6tables", "-A", dpiChain, "-p", "udp", "-m", "conntrack", "--ctstate", "NEW",
+			"-m", "length", "--length", "68", "-m", "u32", "--u32", "48>>24=0x41", "-j", "DROP"},
+	}
+}
+
+// Переход в DPI обязан стоять ПЕРВЫМ правилом хука: ufw (ufw-before-output) и
+// docker (DOCKER-FORWARD) принимают трафик раньше, и при -A в конец цепочки DPI
+// не видел ни ufw-нод, ни bridge-контейнеров. docker/ufw при перезапуске
+// вставляют свои правила наверх — поэтому проверяем и чиним каждую минуту.
+func ensureDPIHooks() {
 	for _, chain := range dpiHooks {
 		for _, ipt := range []string{"iptables", "ip6tables"} {
-			exec.Command(ipt, "-A", chain, "-j", dpiChain).Run()
+			out, err := exec.Command(ipt, "-S", chain).Output()
+			if err != nil {
+				continue
+			}
+			if dpiHookFirst(string(out), chain) {
+				continue
+			}
+			for exec.Command(ipt, "-D", chain, "-j", dpiChain).Run() == nil {
+			}
+			exec.Command(ipt, "-I", chain, "1", "-j", dpiChain).Run()
 		}
 	}
-	return count
+}
+
+// dpiHookFirst: первое правило цепочки (после строки политики -P/-N) — наш переход.
+func dpiHookFirst(rules, chain string) bool {
+	for _, l := range strings.Split(rules, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || strings.HasPrefix(l, "-P ") || strings.HasPrefix(l, "-N ") {
+			continue
+		}
+		return l == "-A "+chain+" -j "+dpiChain
+	}
+	return false
 }
 
 func getDPIDropCount() int64 {
@@ -1073,6 +1140,7 @@ func startCleanupRoutine() {
 		for {
 			time.Sleep(1 * time.Minute)
 			now := time.Now()
+			ensureDPIHooks()
 
 			blockedMu.Lock()
 			var toUnban []string
