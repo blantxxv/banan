@@ -33,7 +33,7 @@ var banHooks = []string{"PREROUTING", "OUTPUT"}
 var (
 	banDuration = 10 * time.Minute
 	peerBanDur  = 24 * time.Hour
-	logFile     = ""
+	logFiles    []string // --log можно повторять: на ноде бывает несколько xray (host-net + bridge-контейнеры)
 	torrentTag  = "TORRENT"
 	// ⚠️ netstat-эвристики (шторм FIN_WAIT / много ESTABLISHED с большой
 	// send-queue) НЕ отличают торрент от моста/релея и банят свою же
@@ -789,16 +789,15 @@ func monitorLog(path string) {
 }
 
 func startLogMonitor() {
-	if logFile == "" {
-		return
+	for _, path := range logFiles {
+		go func(path string) {
+			for {
+				monitorLog(path)
+				time.Sleep(2 * time.Second)
+			}
+		}(path)
+		log.Printf("log monitor started: %s (tag=%s)", path, torrentTag)
 	}
-	go func() {
-		for {
-			monitorLog(logFile)
-			time.Sleep(2 * time.Second)
-		}
-	}()
-	log.Printf("log monitor started: %s (tag=%s)", logFile, torrentTag)
 }
 
 type connEntry struct {
@@ -1150,7 +1149,7 @@ func main() {
 		switch os.Args[i] {
 		case "--log":
 			if i+1 < len(os.Args) {
-				logFile = os.Args[i+1]
+				logFiles = append(logFiles, os.Args[i+1])
 				i++
 			}
 		case "--tag":
@@ -1277,8 +1276,8 @@ func main() {
 	startCleanupRoutine()
 
 	fmt.Printf("torrent blocker started: %d port + %d DPI rules, ban=%v\n", portRules, dpiRules, banDuration)
-	if logFile != "" {
-		fmt.Printf("monitoring log: %s (tag=%s)\n", logFile, torrentTag)
+	for _, path := range logFiles {
+		fmt.Printf("monitoring log: %s (tag=%s)\n", path, torrentTag)
 	}
 	if enableNetstat {
 		fmt.Printf("⚠️  netstat=ON finwait_ban=%v finwait_thresh=%d conn_thresh=%d sendq_thresh=%d — риск ложных банов мостов\n",

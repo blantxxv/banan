@@ -104,7 +104,20 @@ fi
 # С неверным путём блокер слеп. Ищем реально существующий файл.
 info "Поиск access.log xray на хосте..."
 LOGPATH=""
-for cand in \
+LOGARGS=""
+# На одной машине бывает несколько нод (host-net + bridge-контейнеры со своим
+# SNAT-адресом, как на starry .186–.190) — следим за логом КАЖДОГО запущенного
+# remnanode-контейнера, иначе остальные выходы слепы.
+if command -v docker >/dev/null 2>&1; then
+    for c in $(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($0) ~ /remnanode|remnawave\/node/ {print $1}'); do
+        src="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' "$c" 2>/dev/null)"
+        [ -n "$src" ] && [ -f "$src/access.log" ] || continue
+        case " $LOGARGS " in *" --log $src/access.log "*) continue ;; esac
+        LOGARGS="$LOGARGS --log $src/access.log"; LOGPATH="${LOGPATH:-$src/access.log}"
+        ok "access.log ($c): $src/access.log"
+    done
+fi
+[ -z "${LOGPATH}" ] && for cand in \
     /var/log/remnanode/access.log \
     /opt/remnanode/logs/access.log \
     /root/remnanode/logs/access.log \
@@ -120,11 +133,12 @@ if [ -z "${LOGPATH}" ]; then
     LOGPATH="/var/log/remnanode/access.log"
     warn "access.log не найден на хосте — ставлю дефолт ${LOGPATH}."
     warn "Проверь, что в конфиге ноды включён лог доступа, и поправь ExecStart при необходимости."
-else
+elif [ -z "${LOGARGS}" ]; then
     ok "access.log: ${LOGPATH}"
 fi
+[ -z "${LOGARGS}" ] && LOGARGS="--log ${LOGPATH}"
 
-START_CMD="${BINARY} --log ${LOGPATH} --tag TORRENT --no-netstat --no-finwait-ban --ban-duration 10 --bypass-file ${BYPASS_FILE}"
+START_CMD="${BINARY} ${LOGARGS# } --tag TORRENT --no-netstat --no-finwait-ban --ban-duration 10 --bypass-file ${BYPASS_FILE}"
 
 info "Запись systemd unit-файла..."
 cat > "${SERVICE_FILE}" << EOF

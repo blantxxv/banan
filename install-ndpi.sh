@@ -27,6 +27,12 @@ VERSION="1.0"
 LOG=/var/log/torrent-ndpi-install.log
 NDPI_REPO="https://github.com/vel21ripn/nDPI.git"
 NDPI_BRANCH="flow_info-4"
+# Пин на проверенный коммит. HEAD ветки НЕ брать: 12.10.2026 апстрим переписал
+# ndpi-netfilter (убран LIVEPATCH, нужны connlabel + nf_conntrack_events=1), и
+# 15.10.2026 автор сам пометил новую версию «major memory leak, не использовать».
+# 075408a — последний коммит старой архитектуры (09.10.2026). Переопределить:
+# NDPI_REF=<sha|branch> bash install-ndpi.sh
+NDPI_REF="${NDPI_REF:-075408a5b3b2135dacfb7fe28be7da55943ff31c}"
 STATE_DIR=/etc/torrent-blocker
 SBIN=/usr/local/sbin
 KREL="$(uname -r)"
@@ -119,8 +125,14 @@ miss=""; for b in gcc make dkms pkg-config git; do have "$b" || miss="$miss $b";
 
 # ── клон + сборка ───────────────────────────────────────────────────────────
 cd /opt || exit 1; rm -rf ndpi-build
-log "клонирую nDPI ($NDPI_BRANCH)…"
-retry 2 git clone --depth 1 -b "$NDPI_BRANCH" "$NDPI_REPO" ndpi-build >>"$LOG" 2>&1 || { err "git clone nDPI не удался"; exit 1; }
+log "клонирую nDPI ($NDPI_BRANCH @ ${NDPI_REF:0:7})…"
+fetch_ndpi() {
+  rm -rf ndpi-build && git init -q ndpi-build && cd ndpi-build \
+    && git remote add origin "$NDPI_REPO" \
+    && git fetch -q --depth 1 origin "$NDPI_REF" && git checkout -q FETCH_HEAD; local rc=$?
+  cd /opt; return $rc
+}
+retry 2 fetch_ndpi >>"$LOG" 2>&1 || { err "git fetch nDPI ($NDPI_REF) не удался"; exit 1; }
 
 # gcc-only флаг ломает сборку на clang (см. память по флоту) — вырезаем.
 mk=/opt/ndpi-build/ndpi-netfilter/src/Makefile
