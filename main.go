@@ -736,6 +736,113 @@ func isDomainTorrent(dest string) bool {
 	return false
 }
 
+// ── Разлёт по пирам: шифрованный BT по access.log ───────────────────────────
+//
+// Живой тест 20 окт 2026, qBittorrent 5.3 через VLESS на [EE] #29: все пиры
+// шли по TCP с MSE/PE-шифрованием — sniffing xray их не распознал (правило
+// bittorrent→BLOCK не сработало ни разу, всё ушло в DIRECT), DPI тоже слеп.
+// Зато в access.log за 4.5 мин у этого юзера 75 разных IP на высоких портах,
+// у остальных юзеров ноды — 1–2. Считаем ПО EMAIL, а не по IP источника:
+// старые netstat-эвристики банили мосты именно потому, что считали по IP.
+// Источник, за которым видно ≥ fanoutSharedEmails юзеров (мост/релей/NAT),
+// не баним — только пишем в лог.
+var (
+	fanoutThresh = 30
+	fanoutWindow = 5 * time.Minute
+	fanoutMu     sync.Mutex
+	fanoutPeers  = map[string]map[string]time.Time{} // юзер → IP пира → когда видели
+	fanoutSrc    = map[string]map[string]time.Time{} // IP источника → email → когда видели
+	fanoutCalls  int
+)
+
+const fanoutSharedEmails = 3
+
+func extractEmailFromLine(line string) string {
+	fields := strings.Fields(line)
+	for i, f := range fields {
+		if f == "email:" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
+}
+
+// fanoutPeerIP: назначение — голый публичный IP на порту >1024, не из vpnPorts.
+// Домены (сайты, CDN) и стандартные порты в счёт не идут.
+func fanoutPeerIP(dest string) string {
+	d := strings.TrimPrefix(strings.TrimPrefix(dest, "tcp:"), "udp:")
+	host, port, err := net.SplitHostPort(d)
+	if err != nil || net.ParseIP(host) == nil || vpnPorts[port] {
+		return ""
+	}
+	if p, err := strconv.Atoi(port); err != nil || p <= 1024 {
+		return ""
+	}
+	if isProtectedIP(host) {
+		return ""
+	}
+	return host
+}
+
+func pruneSeen(m map[string]time.Time, cutoff time.Time) {
+	for k, t := range m {
+		if t.Before(cutoff) {
+			delete(m, k)
+		}
+	}
+}
+
+// fanoutObserve учитывает строку access.log. hit — юзер достиг порога,
+// shared — его источник общий (мост/NAT), банить IP нельзя.
+func fanoutObserve(clientIP, email, dest string, now time.Time) (hit bool, n int, shared bool) {
+	fanoutMu.Lock()
+	defer fanoutMu.Unlock()
+	cutoff := now.Add(-fanoutWindow)
+
+	fanoutCalls++
+	if fanoutCalls%1000 == 0 {
+		for _, mm := range []map[string]map[string]time.Time{fanoutPeers, fanoutSrc} {
+			for k, m := range mm {
+				if pruneSeen(m, cutoff); len(m) == 0 {
+					delete(mm, k)
+				}
+			}
+		}
+	}
+
+	if clientIP != "" && email != "" {
+		if fanoutSrc[clientIP] == nil {
+			fanoutSrc[clientIP] = map[string]time.Time{}
+		}
+		fanoutSrc[clientIP][email] = now
+	}
+	peer := fanoutPeerIP(dest)
+	if peer == "" {
+		return false, 0, false
+	}
+	key := email
+	if key == "" {
+		key = "ip:" + clientIP
+	}
+	m := fanoutPeers[key]
+	if m == nil {
+		m = map[string]time.Time{}
+		fanoutPeers[key] = m
+	}
+	m[peer] = now
+	pruneSeen(m, cutoff)
+	n = len(m)
+	if n < fanoutThresh {
+		return false, n, false
+	}
+	delete(fanoutPeers, key) // после срабатывания копим заново
+	if src := fanoutSrc[clientIP]; src != nil {
+		pruneSeen(src, cutoff)
+		shared = len(src) >= fanoutSharedEmails
+	}
+	return true, n, shared
+}
+
 // isTrackerHost: HTTPS-трекер по имени (tracker.se7en.ws, tracker2.x.org,
 // retracker.local.ru). Внутри TLS announce не виден, но xray пишет SNI в
 // access.log. Нужна первая метка ровно (re|bt)?tracker\d* и ещё минимум две
@@ -798,6 +905,17 @@ func monitorLog(path string) {
 				if cip != "" && !isProtectedIP(cip) {
 					log.Printf("DOMAIN_TORRENT ban %s (dest=%s)", cip, dest)
 					banIP(cip, "domain_torrent:"+dest)
+				}
+			}
+			if fanoutThresh > 0 && dest != "" {
+				cip := extractClientIPFromLine(line)
+				email := extractEmailFromLine(line)
+				if hit, n, shared := fanoutObserve(cip, email, dest, time.Now()); hit {
+					if shared || cip == "" {
+						log.Printf("PEER_FANOUT %s email=%s: %d пиров за %v — источник общий (мост/NAT), IP не баню", cip, email, n, fanoutWindow)
+					} else {
+						banIP(cip, fmt.Sprintf("peer_fanout:%d/%v user:%s", n, fanoutWindow, email))
+					}
 				}
 			}
 			continue
@@ -1349,6 +1467,20 @@ func main() {
 					if p != "" {
 						vpnPorts[p] = true
 					}
+				}
+				i++
+			}
+		case "--fanout":
+			if i+1 < len(os.Args) {
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					fanoutThresh = n
+				}
+				i++
+			}
+		case "--fanout-window":
+			if i+1 < len(os.Args) {
+				if m, err := strconv.Atoi(os.Args[i+1]); err == nil && m > 0 {
+					fanoutWindow = time.Duration(m) * time.Minute
 				}
 				i++
 			}
