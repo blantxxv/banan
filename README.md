@@ -84,8 +84,27 @@ go build -o main main.go
 - все адреса интерфейсов самой ноды (собираются на старте автоматически);
 - всё, что перечислено в `bypass.txt` (IP или CIDR).
 
+DPI-ловушки `CATCH_PEER`/`CATCH_TRACKER` тоже не заносят в ipset локальные и
+приватные адреса: на входящем пакете пир→нода `dst` — это сама нода или
+контейнер за DNAT (так в 2026 году падала EE-нода, `172.30.44.2` в `auto_peers_v4`).
+
 Порты нод/мостов (`443, 3443, 8443, 2096, 4443, 2053, 2083, 2087, 8080, 22,
-853` и VPN-порты) исключены и из DPI, и из блокировки портов.
+853` и VPN-порты) исключены и из DPI, и из блокировки портов. Исключение одно:
+открытый HTTP на `:80` проверяется HTTP-сигнатурами (announce, `info_hash=`,
+User-Agent клиентов, веб-сид `BTWebClient`) — только DROP пакета, без ipset.
+
+### Проверено на живом захвате (uTorrent 3.6.0, 20 окт 2026)
+
+| Что на проводе | Чем ловится |
+|---|---|
+| `\x13BitTorrent protocol`, peer_id `-UT360W-` | hex-сигнатура хендшейка |
+| расширенный хендшейк `12:complete_ago…11:ut_metadata` | `12:complete_ago`, `11:ut_metadata`, `upload_only`… |
+| PEX `5:added…7:added.f…7:dropped` | `7:added.f` |
+| uTP ST_SYN, 20 байт, первый байт `0x41` | u32-правило, IP-пакет 48 байт |
+| DHT `find_node`, `1:v4:UT` | `d1:ad2:id20:`, `1:q9:find_node` |
+| UDP-трекер connect `0x41727101980` | hex-сигнатура BEP15 |
+| веб-сид `GET … Range:` с `User-Agent: BTWebClient/360S` на `:80` | `User-Agent: BTWebClient` по `--dport 80` |
+| HTTPS-трекеры `tracker.se7en.ws`, `tracker.7launcher.*`, `ledger.bt.co` | домен в access.log (`isTrackerHost`, `bt.co`) |
 
 **Мосты/релеи/воронки заносим в `bypass.txt`** — по одному IP или CIDR на строку,
 затем `systemctl reload torrent-blocker` (перечитает без простоя). Пример:

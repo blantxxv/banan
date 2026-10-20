@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/hex"
 	"strconv"
 	"strings"
 	"testing"
@@ -277,5 +279,131 @@ func TestDPIInspectsPayloadAndUTP(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(rules[1], " "), "--length 68") {
 		t.Error("uTP v6: длина 40+8+20=68")
+	}
+}
+
+// ── Живой захват uTorrent 3.6.0 (20 окт 2026, без VPN, Ethernet) ─────────────
+// Байты взяты из pcap как есть. Каждый образец обязан матчиться сигнатурой
+// (так же, как -m string --to 1500), а HTTP — ещё и правилом по --dport 80.
+func sigMatches(proto string, dport int, payload []byte) []string {
+	var hit []string
+	for _, s := range signatures {
+		if s.proto != proto || (s.dport != 0 && s.dport != dport) {
+			continue
+		}
+		var needle []byte
+		if s.hex != "" {
+			var err error
+			needle, err = hex.DecodeString(strings.Trim(s.hex, "|"))
+			if err != nil {
+				continue
+			}
+		} else {
+			needle = []byte(s.pattern)
+		}
+		if bytes.Contains(payload, needle) {
+			hit = append(hit, s.pattern+s.hex)
+		}
+	}
+	return hit
+}
+
+func mustHex(t *testing.T, s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestLiveUTorrentCapture(t *testing.T) {
+	cases := []struct {
+		name    string
+		proto   string
+		dport   int
+		payload []byte
+	}{
+		{"BT-хендшейк (peer_id -UT360W-)", "tcp", 11720,
+			append([]byte("\x13BitTorrent protocol\x00\x00\x00\x00\x00\x10\x00\x05"), make([]byte, 40)...)},
+		{"расширенный хендшейк BEP10", "tcp", 11720,
+			[]byte("\x00\x00\x019\x14\x00d1:ei0e4:ipv44:%\xe6\x94p12:complete_agoi23e1:md11:upload_onlyi3e11:lt_donthavei7e12:ut_holepunchi4e11:ut_metadatai2e6:ut_pexi1ee")},
+		{"PEX посреди потока", "tcp", 13070,
+			[]byte("\x00\x00\x00\xa2\x14\x01d5:added78:)\xb6\xc2\x38*\x1a\xc2\xbb7:added.f13:\x00\x00\x00\x007:dropped0:e")},
+		{"DHT find_node (v=UT)", "udp", 64276,
+			[]byte("d1:ad2:id20:\x16\xe4\x1e\x93gB\x96\x1b{D!\x0f#\xfa-\x9a\xb1\x06+\xbc6:target20:\x16\xe4\x1e\x93gB\x96\x1b{D!\x0f#\xfa-\x9a\xb1\x06+\xbce1:q9:find_node1:t4:abcd1:v4:UT\x00\x001:y1:qe")},
+		{"UDP-трекер connect", "udp", 8086, mustHex(t, "000004172710198000000000101d2f4d")},
+		{"веб-сид HTTP GET (BEP19)", "tcp", 80,
+			[]byte("GET /c/GTA%20San%20Andreas/Data/data-20.bin HTTP/1.1\r\nHost: vasyan.space\r\nUser-Agent: BTWebClient/360S\r\nConnection: keep-alive\r\nRange: bytes=0-16383\r\n\r\n")},
+	}
+	for _, c := range cases {
+		if len(sigMatches(c.proto, c.dport, c.payload)) == 0 {
+			t.Errorf("живой образец НЕ пойман: %s", c.name)
+		}
+	}
+
+	// Веб-сид идёт на :80, а 80 в vpnPorts → без отдельного правила его бы отпустил RETURN.
+	found := false
+	for _, r := range httpSigRules() {
+		s := strings.Join(r, " ")
+		if strings.Contains(s, "--dport 80") && strings.Contains(s, "BTWebClient") && strings.HasSuffix(s, "-j DROP") {
+			found = true
+		}
+		if strings.Contains(s, "CATCH_") {
+			t.Errorf("HTTP-правило на :80 не должно заносить IP в ipset (Cloudflare): %s", s)
+		}
+	}
+	if !found {
+		t.Error("нет правила --dport 80 для User-Agent: BTWebClient")
+	}
+
+	// uTP SYN из захвата: 20 байт, первый байт 0x41 → IP-пакет 48 байт (u32-правило).
+	syn := mustHex(t, "410076fa0c4942ce0000000000100000e2830000")
+	if len(syn) != 20 || syn[0] != 0x41 {
+		t.Fatalf("образец uTP SYN испорчен")
+	}
+	if !strings.Contains(strings.Join(utpSynRules()[0], " "), "--length 48") {
+		t.Error("uTP SYN uTorrent = 20+8+20 = 48 байт, правило должно бить ровно эту длину")
+	}
+}
+
+// HTTPS-трекеры и телеметрия uTorrent видны только по SNI в access.log.
+func TestTrackerHostsFromCapture(t *testing.T) {
+	for _, d := range []string{"tracker.se7en.ws", "tracker.7launcher.com", "tracker.7launcher.ru",
+		"retracker.local.ru", "tracker2.example.org", "ledger.bt.co", "x-666.b-0.ad.bench.utorrent.com"} {
+		if !isDomainTorrent(d) {
+			t.Errorf("не распознан: %s", d)
+		}
+	}
+	for _, d := range []string{"tracker-api.my.com", "tracker.gg", "bt.com", "debt.co", "trackerlist.example.com",
+		"cdn.tracker-stats.io", "panel.boost34.online"} {
+		if isDomainTorrent(d) {
+			t.Errorf("НЕБЕЗОПАСНО: %s ошибочно принят за трекер", d)
+		}
+	}
+}
+
+// Входящий пакет пир→нода матчит PEER-сигнатуру с dst = нода/контейнер.
+// Такой dst нельзя заносить в ipset (инцидент EE 15/17 окт: 172.30.44.2).
+func TestCatchChainNeverPoisonsLocal(t *testing.T) {
+	for _, ipt := range []string{"iptables", "ip6tables"} {
+		rules := catchChainRules(ipt, "CATCH_PEER", "auto_peers_v4")
+		setAt, localAt, privAt := -1, -1, -1
+		for i, r := range rules {
+			s := strings.Join(r, " ")
+			switch {
+			case strings.Contains(s, "--add-set"):
+				setAt = i
+			case strings.Contains(s, "--dst-type LOCAL"):
+				localAt = i
+			case strings.Contains(s, "-d 172.16.0.0/12") || strings.Contains(s, "-d fc00::/7"):
+				privAt = i
+			}
+		}
+		if setAt < 0 || localAt < 0 || privAt < 0 || localAt > setAt || privAt > setAt {
+			t.Errorf("%s: защита локальных/приватных dst должна стоять ДО SET: %v", ipt, rules)
+		}
+		if last := strings.Join(rules[len(rules)-1], " "); last != "-A CATCH_PEER -j DROP" {
+			t.Errorf("%s: последним должен быть DROP, есть %q", ipt, last)
+		}
 	}
 }

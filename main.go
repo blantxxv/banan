@@ -101,6 +101,10 @@ type signature struct {
 	hex     string
 	dport   int
 	action  string
+	// http: открытый HTTP-запрос (трекер/веб-сид). Порт 80 стоит в vpnPorts,
+	// поэтому такие сигнатуры дополнительно проверяются по --dport 80 ДО
+	// общего RETURN — см. httpSigRules().
+	http bool
 }
 
 var signatures = []signature{
@@ -129,43 +133,51 @@ var signatures = []signature{
 	{proto: "tcp", pattern: "12:ut_holepunch", action: "PEER"},
 	{proto: "tcp", pattern: "upload_only", action: "PEER"},
 	{proto: "tcp", pattern: "lt_donthave", action: "PEER"},
+	// Сняты с живого uTorrent 3.6 (20 окт 2026): ключ расширенного хендшейка
+	// uTorrent/libtorrent и PEX-сообщение (BEP11), идущее и посреди потока.
+	{proto: "tcp", pattern: "12:complete_ago", action: "PEER"},
+	{proto: "tcp", pattern: "7:added.f", action: "PEER"},
 	// UDP-трекер (BEP15): connect-запрос всегда начинается с protocol_id 0x41727101980.
 	{proto: "udp", hex: "|0000041727101980|", action: "TRACKER"},
-	{proto: "tcp", pattern: "info_hash=", action: "TRACKER"},
-	{proto: "tcp", pattern: "peer_id=", action: "TRACKER"},
-	{proto: "tcp", pattern: "announce?", action: "TRACKER"},
-	{proto: "tcp", pattern: "scrape?", action: "TRACKER"},
-	{proto: "tcp", pattern: "event=started", action: "TRACKER"},
-	{proto: "tcp", pattern: "event=stopped", action: "TRACKER"},
-	{proto: "tcp", pattern: "event=completed", action: "TRACKER"},
+	{proto: "tcp", pattern: "info_hash=", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "peer_id=", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "announce?", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "scrape?", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "event=started", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "event=stopped", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "event=completed", action: "TRACKER", http: true},
 	{proto: "tcp", pattern: "d8:announce", action: "TRACKER"},
 	{proto: "tcp", pattern: "d13:announce-list", action: "TRACKER"},
-	{proto: "tcp", pattern: "/announce HTTP", action: "TRACKER"},
-	{proto: "tcp", pattern: "/scrape HTTP", action: "TRACKER"},
+	{proto: "tcp", pattern: "/announce HTTP", action: "TRACKER", http: true},
+	{proto: "tcp", pattern: "/scrape HTTP", action: "TRACKER", http: true},
 	// magnet-ссылки и info-hash в открытом HTTP (btih = BitTorrent Info Hash).
-	{proto: "tcp", pattern: "xt=urn:btih:", action: "DROP"},
-	{proto: "tcp", pattern: "urn:btih:", action: "DROP"},
-	{proto: "tcp", pattern: "urn:btmh:", action: "DROP"}, // BitTorrent v2 multihash
+	{proto: "tcp", pattern: "xt=urn:btih:", action: "DROP", http: true},
+	{proto: "tcp", pattern: "urn:btih:", action: "DROP", http: true},
+	{proto: "tcp", pattern: "urn:btmh:", action: "DROP", http: true}, // BitTorrent v2 multihash
 	// Local Service Discovery (BEP14) — мультикаст-анонс пиров в локальной сети.
 	{proto: "udp", pattern: "BT-SEARCH * HTTP/1.1", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: uTorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: BitTorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: qBittorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: Transmission", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: libtorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: Deluge", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: Vuze", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: Azureus", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: uTorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: BitTorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: qBittorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: Transmission", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: libtorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: Deluge", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: Vuze", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: Azureus", action: "DROP", http: true},
 	{proto: "tcp", pattern: "User-Agent: Aria2", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: WebTorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: Tixati", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: BiglyBT", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: BitComet", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: BitLord", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: KTorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: rtorrent", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: Folx", action: "DROP"},
-	{proto: "tcp", pattern: "User-Agent: FrostWire", action: "DROP"},
+	{proto: "tcp", pattern: "User-Agent: WebTorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: Tixati", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: BiglyBT", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: BitComet", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: BitLord", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: KTorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: rtorrent", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: Folx", action: "DROP", http: true},
+	{proto: "tcp", pattern: "User-Agent: FrostWire", action: "DROP", http: true},
+	// Веб-сид (BEP19/url-list) uTorrent/BitTorrent: файлы раздачи качаются
+	// обычным HTTP GET с Range на :80 — без BT-хендшейка, xray не тегирует
+	// это как bittorrent. В живом захвате это был заметный объём загрузки.
+	{proto: "tcp", pattern: "User-Agent: BTWebClient", action: "DROP", http: true},
 	{proto: "udp", dport: 53, pattern: "router.bittorrent.com", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "router.utorrent.com", action: "DROP"},
 	{proto: "udp", dport: 53, pattern: "dht.transmissionbt.com", action: "DROP"},
@@ -214,6 +226,7 @@ var torrentDestDomains = []string{
 	"tracker.torrent.eu.org", "tracker.dler.org",
 	"router.bittorrent.com", "router.utorrent.com",
 	"dht.transmissionbt.com",
+	"bt.co", // BitTorrent Inc: ledger.bt.co дёргает сам uTorrent (живой захват)
 }
 
 var torrentDestKeywords = []string{
@@ -711,6 +724,9 @@ func isDomainTorrent(dest string) bool {
 			return true
 		}
 	}
+	if isTrackerHost(host) {
+		return true
+	}
 
 	for _, kw := range torrentDestKeywords {
 		if strings.Contains(host, kw) {
@@ -718,6 +734,27 @@ func isDomainTorrent(dest string) bool {
 		}
 	}
 	return false
+}
+
+// isTrackerHost: HTTPS-трекер по имени (tracker.se7en.ws, tracker2.x.org,
+// retracker.local.ru). Внутри TLS announce не виден, но xray пишет SNI в
+// access.log. Нужна первая метка ровно (re|bt)?tracker\d* и ещё минимум две
+// метки — «tracker-api.my.com» и «tracker.gg» сюда не попадают.
+func isTrackerHost(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) < 3 {
+		return false
+	}
+	l := strings.TrimPrefix(strings.TrimPrefix(parts[0], "re"), "bt")
+	if !strings.HasPrefix(l, "tracker") {
+		return false
+	}
+	for _, c := range l[len("tracker"):] {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func monitorLog(path string) {
@@ -977,6 +1014,7 @@ func applyDPI() int {
 	// connbytes без учёта conntrack видит 0 байт → через сигнатуры шёл бы ВЕСЬ трафик.
 	exec.Command("sysctl", "-qw", "net.netfilter.nf_conntrack_acct=1").Run()
 	os.WriteFile("/etc/sysctl.d/90-torrent-blocker.conf", []byte("net.netfilter.nf_conntrack_acct=1\n"), 0644)
+	count := 0
 	for _, ipt := range []string{"iptables", "ip6tables"} {
 		exec.Command(ipt, "-N", dpiChain).Run()
 		exec.Command(ipt, "-N", "CATCH_TRACKER").Run()
@@ -985,10 +1023,12 @@ func applyDPI() int {
 		if ipt == "ip6tables" {
 			sfx = "_v6"
 		}
-		exec.Command(ipt, "-A", "CATCH_TRACKER", "-j", "SET", "--add-set", "auto_trackers"+sfx, "dst").Run()
-		exec.Command(ipt, "-A", "CATCH_TRACKER", "-j", "DROP").Run()
-		exec.Command(ipt, "-A", "CATCH_PEER", "-j", "SET", "--add-set", "auto_peers"+sfx, "dst").Run()
-		exec.Command(ipt, "-A", "CATCH_PEER", "-j", "DROP").Run()
+		for _, r := range catchChainRules(ipt, "CATCH_TRACKER", "auto_trackers"+sfx) {
+			exec.Command(ipt, r...).Run()
+		}
+		for _, r := range catchChainRules(ipt, "CATCH_PEER", "auto_peers"+sfx) {
+			exec.Command(ipt, r...).Run()
+		}
 
 		exec.Command(ipt, "-A", dpiChain, "-i", "lo", "-j", "RETURN").Run()
 		exec.Command(ipt, "-A", dpiChain, "-o", "lo", "-j", "RETURN").Run()
@@ -1001,6 +1041,15 @@ func applyDPI() int {
 			log.Printf("%s: connbytes недоступен — DPI видит только первый пакет потока", ipt)
 			exec.Command(ipt, "-A", dpiChain, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "RETURN").Run()
 		}
+		// Порт 80 в vpnPorts, и RETURN ниже отпускал ВСЕ HTTP-сигнатуры:
+		// announce/info_hash/User-Agent клиентов на :80 не матчились никогда.
+		// Живой uTorrent 3.6 (20 окт 2026) тянул веб-сид чистым HTTP на :80.
+		// Поэтому до RETURN — HTTP-сигнатуры по --dport 80, только DROP.
+		for _, r := range httpSigRules() {
+			if exec.Command(ipt, r...).Run() == nil {
+				count++
+			}
+		}
 		for port := range vpnPorts {
 			for _, proto := range []string{"tcp", "udp"} {
 				exec.Command(ipt, "-A", dpiChain, "-p", proto, "--dport", port, "-j", "RETURN").Run()
@@ -1009,7 +1058,6 @@ func applyDPI() int {
 		}
 	}
 
-	count := 0
 	for _, r := range utpSynRules() {
 		if exec.Command(r[0], r[1:]...).Run() == nil {
 			count++
@@ -1047,6 +1095,48 @@ func applyDPI() int {
 	}
 	ensureDPIHooks()
 	return count
+}
+
+// httpSigRules: сигнатуры открытого HTTP (трекер, веб-сид, User-Agent клиента)
+// по tcp --dport 80. Цель только DROP, без ipset: трекеры и веб-сиды сидят за
+// Cloudflare, и занесение их IP в auto_trackers отрезало бы чужие сайты.
+func httpSigRules() [][]string {
+	var rules [][]string
+	for _, sig := range signatures {
+		if !sig.http {
+			continue
+		}
+		args := []string{"-A", dpiChain, "-p", "tcp", "--dport", "80",
+			"-m", "string", "--algo", "bm", "--to", "1500"}
+		if sig.hex != "" {
+			args = append(args, "--hex-string", sig.hex)
+		} else {
+			args = append(args, "--string", sig.pattern)
+		}
+		rules = append(rules, append(args, "-j", "DROP"))
+	}
+	return rules
+}
+
+// catchChainRules: CATCH_PEER/CATCH_TRACKER заносят dst в ipset и дропают.
+// Но сигнатуры матчатся в обе стороны: на ВХОДЯЩЕМ пакете пир→нода dst — это
+// адрес самой ноды или docker-контейнера за DNAT. Так 15 и 17 окт 2026 в
+// auto_peers_v4 попал 172.30.44.2 (контейнер EE), и DROP в OUTPUT/FORWARD
+// положил ноду целиком. Локальные и приватные dst — только DROP пакета, без SET.
+func catchChainRules(ipt, chain, set string) [][]string {
+	var rules [][]string
+	rules = append(rules, []string{"-A", chain, "-m", "addrtype", "--dst-type", "LOCAL", "-j", "DROP"})
+	nets := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8"}
+	if ipt == "ip6tables" {
+		nets = []string{"fc00::/7", "fe80::/10", "::1/128"}
+	}
+	for _, n := range nets {
+		rules = append(rules, []string{"-A", chain, "-d", n, "-j", "DROP"})
+	}
+	rules = append(rules,
+		[]string{"-A", chain, "-j", "SET", "--add-set", set, "dst"},
+		[]string{"-A", chain, "-j", "DROP"})
+	return rules
 }
 
 // Сколько байт каждого потока (в обе стороны) прогоняется через сигнатуры.
