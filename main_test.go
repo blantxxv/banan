@@ -574,6 +574,21 @@ func TestFanoutConfirmDisabled(t *testing.T) {
 	}
 }
 
+// --fanout-dry-run: решение «бан» только логируется, в blockedIPs ничего не попадает.
+func TestFanoutDryRunDoesNotBan(t *testing.T) {
+	resetBypass()
+	old := fanoutDryRun
+	fanoutDryRun = true
+	defer func() { fanoutDryRun = old }()
+	fanoutApply(fanoutVerdict{Ban: true, ClientIP: "203.0.113.77", Key: "4", Reason: "torrent_peers:3"})
+	blockedMu.Lock()
+	_, banned := blockedIPs["203.0.113.77"]
+	blockedMu.Unlock()
+	if banned {
+		t.Fatal("dry-run забанил клиента")
+	}
+}
+
 func TestLineOutboundTag(t *testing.T) {
 	for line, want := range map[string]string{
 		"from 1.2.3.4:5 accepted tcp:x:1 [VLESS_TCP_TLS_EE3_443_clone -> BLOCK] email: 4":  "BLOCK",

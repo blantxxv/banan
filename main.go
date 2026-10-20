@@ -1029,9 +1029,29 @@ func fanoutGC(now time.Time) {
 	}
 }
 
+// fanoutDryRun (--fanout-dry-run): детектор только пишет «DRY-RUN забанил бы»
+// в журнал, а банов не делает. Старые пути бана (тег TORRENT, домены) и DPI
+// работают как обычно. Для обкатки порогов на живом флоте.
+var (
+	fanoutDryRun    = false
+	fanoutDryLogged = map[string]time.Time{}
+)
+
 // fanoutApply: бан по решению детектора (общий источник — только лог).
 func fanoutApply(v fanoutVerdict) {
 	if !v.Ban {
+		return
+	}
+	if fanoutDryRun {
+		fanoutMu.Lock()
+		last, seen := fanoutDryLogged[v.Key]
+		if !seen || time.Since(last) > banDuration {
+			fanoutDryLogged[v.Key] = time.Now()
+			fanoutMu.Unlock()
+			log.Printf("PEER_FANOUT DRY-RUN забанил бы %s user=%s %s shared=%v", v.ClientIP, v.Key, v.Reason, v.Shared)
+			return
+		}
+		fanoutMu.Unlock()
 		return
 	}
 	if v.Shared || v.ClientIP == "" {
@@ -1706,6 +1726,8 @@ func main() {
 				}
 				i++
 			}
+		case "--fanout-dry-run":
+			fanoutDryRun = true
 		case "--fanout-ports":
 			if i+1 < len(os.Args) {
 				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {

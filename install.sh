@@ -147,6 +147,8 @@ fi
 [ -z "${LOGARGS}" ] && LOGARGS="--log ${LOGPATH}"
 
 START_CMD="${BINARY} ${LOGARGS# } --tag TORRENT --no-netstat --no-finwait-ban --ban-duration 10 --bypass-file ${BYPASS_FILE}"
+# TB_ARGS="<флаги>": дописать в ExecStart (напр. TB_ARGS=--fanout-dry-run для обкатки).
+[ -n "${TB_ARGS:-}" ] && START_CMD="${START_CMD} ${TB_ARGS}"
 
 info "Запись systemd unit-файла..."
 cat > "${SERVICE_FILE}" << EOF
