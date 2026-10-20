@@ -230,6 +230,9 @@ var torrentDestDomains = []string{
 	"router.bittorrent.com", "router.utorrent.com",
 	"dht.transmissionbt.com",
 	"bt.co", // BitTorrent Inc: ledger.bt.co дёргает сам uTorrent (живой захват)
+	// HTTPS-трекеры репаков из живого захвата uTorrent (20 окт 2026)
+	"se7en.ws", "7launcher.com", "7launcher.ru",
+	"nanoha.org",
 }
 
 var torrentDestKeywords = []string{
@@ -712,7 +715,7 @@ func extractClientIPFromLine(line string) string {
 func isDomainTorrent(dest string) bool {
 	dest = strings.TrimPrefix(dest, "tcp:")
 	dest = strings.TrimPrefix(dest, "udp:")
-	host, _, _ := net.SplitHostPort(dest)
+	host, port, _ := net.SplitHostPort(dest)
 	if host == "" {
 		host = dest
 	}
@@ -727,7 +730,11 @@ func isDomainTorrent(dest string) bool {
 			return true
 		}
 	}
-	if isTrackerHost(host) {
+	// По имени tracker.* — только на нестандартных портах: на 80/443 это
+	// сплошь аналитика (живые ложные баны 21 окт: tracker.comagic.ru,
+	// tracker.aviasales.com, tracker.zmaticoo.com). Торрент-трекеры на 443
+	// ловятся явным списком и ключевыми словами.
+	if port != "80" && port != "443" && port != "" && isTrackerHost(host) {
 		return true
 	}
 

@@ -375,13 +375,16 @@ func TestLiveUTorrentCapture(t *testing.T) {
 
 // HTTPS-трекеры и телеметрия uTorrent видны только по SNI в access.log.
 func TestTrackerHostsFromCapture(t *testing.T) {
-	for _, d := range []string{"tracker.se7en.ws", "tracker.7launcher.com", "tracker.7launcher.ru",
-		"retracker.local.ru", "tracker2.example.org", "ledger.bt.co", "x-666.b-0.ad.bench.utorrent.com"} {
+	for _, d := range []string{"tcp:tracker.se7en.ws:443", "tcp:tracker.7launcher.com:443", "tracker.7launcher.ru",
+		"udp:retracker.local.ru:6969", "tcp:tracker2.example.org:2710", "tcp:tracker.nanoha.org:443",
+		"ledger.bt.co", "x-666.b-0.ad.bench.utorrent.com"} {
 		if !isDomainTorrent(d) {
 			t.Errorf("не распознан: %s", d)
 		}
 	}
-	for _, d := range []string{"tracker-api.my.com", "tracker.gg", "bt.com", "debt.co", "trackerlist.example.com",
+	// Живые ложные баны 21 окт: аналитика с меткой tracker на 443.
+	for _, d := range []string{"tcp:tracker.comagic.ru:443", "tcp:tracker.aviasales.com:443", "tcp:tracker.zmaticoo.com:443",
+		"tcp:tracker.example.com:80", "tracker-api.my.com", "tracker.gg", "bt.com", "debt.co", "trackerlist.example.com",
 		"cdn.tracker-stats.io", "panel.boost34.online"} {
 		if isDomainTorrent(d) {
 			t.Errorf("НЕБЕЗОПАСНО: %s ошибочно принят за трекер", d)
