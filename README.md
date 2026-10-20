@@ -23,6 +23,7 @@
 main.go            — демон слоя B (запускается на серверах)
 install.sh         — установщик слоя B (сборка на ноде); --with-ndpi добавляет слой A
 install-ndpi.sh    — установщик слоя A (xt_ndpi + DKMS + self-heal)
+log-rotate.sh      — ротация access/error логов remnanode (ставит install.sh)
 deployer/
   main.go          — массовый деплой по SSH (запускает install.sh)
   go.mod / go.sum
@@ -36,7 +37,28 @@ ssh.txt.example    — пример файла серверов
 curl -fsSL https://raw.githubusercontent.com/blantxxv/banan/main/install.sh | bash
 # слой B + слой A (nDPI):
 curl -fsSL https://raw.githubusercontent.com/blantxxv/banan/main/install.sh | bash -s -- --with-ndpi
+# обкатка: детектор только пишет «DRY-RUN забанил бы» в журнал, без банов
+curl -fsSL https://raw.githubusercontent.com/blantxxv/banan/main/install.sh | TB_ARGS=--fanout-dry-run bash
 ```
+
+Переменные установщика:
+
+| Переменная | Что делает |
+|---|---|
+| `TB_ARGS="<флаги>"` | Дописать флаги в ExecStart (напр. `--fanout-dry-run`, лишний `--log <путь>`) |
+| `TB_BIN=<путь>` | Поставить готовый бинарь без Go и сборки (флот-раскатка одной сборкой) |
+| `TB_ROTATE=0` | Не настраивать ротацию логов (по умолчанию настраивается) |
+
+**Ротация логов** (`log-rotate.sh`, ставится установщиком): блокеру нужен
+access.log xray, но без ротации он растёт до десятков ГБ (на флоте видели
+1.2, 3.1 и 20.6 ГБ). Схема: 200 МБ × 3 архива, `copytruncate`, архивы старой
+схемы старше 3 дней удаляются; запуск каждые 10 мин через cron, а где cron нет —
+systemd-таймер `remnanode-logrotate.timer`. Папка логов берётся из
+docker-монтирования remnanode; вручную — `D=/opt/<нода>/logs sh log-rotate.sh`.
+
+Боевой режим после обкатки: убрать `--fanout-dry-run` из ExecStart
+(`systemctl edit --full torrent-blocker`) и `systemctl restart torrent-blocker`.
+Смотреть, кого детектор забанил бы: `journalctl -u torrent-blocker | grep DRY-RUN`.
 
 ## Запуск слоя B вручную
 
@@ -64,6 +86,7 @@ go build -o main main.go
 | `--fanout-ports <n>` | …и ≥n разных портов (default: 20) |
 | `--fanout-window <мин>` | Окно разлёта (default: 5) |
 | `--confirm-peers <n>` | Бан сразу при n подтверждённых торрент-пирах (default: 3, `0` — без сверки с ipset) |
+| `--fanout-dry-run` | Детектор юзеров только логирует `PEER_FANOUT DRY-RUN забанил бы …`, не банит (тег TORRENT, домены и DPI работают как обычно) |
 
 Команды:
 

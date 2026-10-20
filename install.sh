@@ -197,6 +197,16 @@ iptables -t raw -L TORRENT_BAN -n 2>/dev/null | head -5 || true
 cd /
 rm -rf "${TMPDIR}"
 
+# ── Ротация логов xray (TB_ROTATE=0 — пропустить) ───────────────────────────
+if [ "${TB_ROTATE:-1}" = "1" ]; then
+    info "Ротация логов remnanode..."
+    if [ -f "$(dirname "$0")/log-rotate.sh" ]; then
+        sh "$(dirname "$0")/log-rotate.sh" && ok "Ротация настроена" || warn "Ротация не настроена"
+    else
+        curl -fsSL "${REPO}/log-rotate.sh" | sh && ok "Ротация настроена" || warn "Ротация не настроена"
+    fi
+fi
+
 # ── Слой A (nDPI), опционально ──────────────────────────────────────────────
 if [ "${WITH_NDPI}" = "1" ]; then
     echo
