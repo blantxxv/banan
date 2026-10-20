@@ -109,6 +109,9 @@ type signature struct {
 
 var signatures = []signature{
 	{proto: "tcp", hex: "|13426974546f7272656e742070726f746f636f6c|", action: "PEER"},
+	// Тот же хендшейк внутри uTP (UDP, сразу за 20-байтным заголовком): живой
+	// uFiler/libtorrent (-LT1140-) на [EE] #29, 20 окт 2026 — основной объём шёл по uTP.
+	{proto: "udp", hex: "|13426974546f7272656e742070726f746f636f6c|", action: "PEER"},
 	{proto: "udp", pattern: "d1:ad2:id20:", action: "PEER"},
 	{proto: "udp", pattern: "d1:rd2:id20:", action: "PEER"},
 	{proto: "udp", pattern: "1:q9:get_peers", action: "PEER"},

@@ -334,6 +334,11 @@ func TestLiveUTorrentCapture(t *testing.T) {
 		{"DHT find_node (v=UT)", "udp", 64276,
 			[]byte("d1:ad2:id20:\x16\xe4\x1e\x93gB\x96\x1b{D!\x0f#\xfa-\x9a\xb1\x06+\xbc6:target20:\x16\xe4\x1e\x93gB\x96\x1b{D!\x0f#\xfa-\x9a\xb1\x06+\xbce1:q9:find_node1:t4:abcd1:v4:UT\x00\x001:y1:qe")},
 		{"UDP-трекер connect", "udp", 8086, mustHex(t, "000004172710198000000000101d2f4d")},
+		// uFiler (libtorrent -LT1140-) через VLESS на [EE] #29: 20 байт uTP ST_DATA + хендшейк.
+		{"uFiler: BT-хендшейк внутри uTP", "udp", 10786,
+			mustHex(t, "01012859f755c19622c7ecd8000fece71ff8145000"+"13426974546f7272656e742070726f746f636f6c"+"0000000000100005"+"2d4c54313134302d")},
+		{"uFiler: DHT get_peers (v=LT)", "udp", 13932,
+			[]byte("d1:ad2:id20:aaaaaaaaaaaaaaaaaaaa9:info_hash20:bbbbbbbbbbbbbbbbbbbbe1:q9:get_peers1:v4:LT111:y1:qe")},
 		{"веб-сид HTTP GET (BEP19)", "tcp", 80,
 			[]byte("GET /c/GTA%20San%20Andreas/Data/data-20.bin HTTP/1.1\r\nHost: vasyan.space\r\nUser-Agent: BTWebClient/360S\r\nConnection: keep-alive\r\nRange: bytes=0-16383\r\n\r\n")},
 	}
