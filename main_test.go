@@ -574,6 +574,31 @@ func TestFanoutConfirmDisabled(t *testing.T) {
 	}
 }
 
+// Живой Estoxy-мост 21 окт: техпользователь sys_bridge_ru145 (id 178334) — весь
+// трафик RU-ноды, 167 пиров за 1.5 мин. Его источник (наш релей) в bypass →
+// Protected, бана нет даже если за IP виден один email.
+func TestFanoutTechUserBehindBypassedRelay(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	addBypassIP("78.159.240.0/20")
+	defer resetBypass()
+	t0 := time.Now()
+	var v fanoutVerdict
+	for i := 0; i < 3; i++ {
+		v = feedLine(fmt.Sprintf("from 78.159.245.184:%d accepted tcp:83.%d.1.1:%d [x -> BLOCK] email: 178334", i, i, 7000+i), t0)
+	}
+	if !v.Ban || !v.Protected {
+		t.Fatalf("ожидали Ban+Protected для техюзера за релеем: %+v", v)
+	}
+	fanoutApply(v)
+	blockedMu.Lock()
+	_, banned := blockedIPs["78.159.245.184"]
+	blockedMu.Unlock()
+	if banned {
+		t.Fatal("НЕБЕЗОПАСНО: забанен IP нашего релея")
+	}
+}
+
 // --fanout-dry-run: решение «бан» только логируется, в blockedIPs ничего не попадает.
 func TestFanoutDryRunDoesNotBan(t *testing.T) {
 	resetBypass()

@@ -803,6 +803,7 @@ type fanoutUser struct {
 type fanoutVerdict struct {
 	Ban          bool
 	Shared       bool
+	Protected    bool // источник в bypass/приватный — IP не баним
 	Key          string
 	ClientIP     string
 	Hosts, Ports int
@@ -936,6 +937,10 @@ func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 		pruneSeen(src, cutoff)
 		v.Shared = len(src) >= fanoutSharedEmails
 	}
+	// Источник из bypass (наш релей/мост): за ним техпользователь вроде
+	// sys_bridge_ru145 — сумма сотен людей, банить IP нельзя (banIP и так
+	// откажет, но лог должен говорить правду).
+	v.Protected = u.clientIP != "" && isProtectedIP(u.clientIP)
 	delete(fanoutUsers, key) // после бана копим с нуля
 	return v
 }
@@ -1040,6 +1045,10 @@ var (
 // fanoutApply: бан по решению детектора (общий источник — только лог).
 func fanoutApply(v fanoutVerdict) {
 	if !v.Ban {
+		return
+	}
+	if v.Protected {
+		log.Printf("PEER_FANOUT %s user=%s %s — источник в bypass (релей/мост), IP не баню", v.ClientIP, v.Key, v.Reason)
 		return
 	}
 	if fanoutDryRun {
