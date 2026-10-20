@@ -415,74 +415,137 @@ func TestCatchChainNeverPoisonsLocal(t *testing.T) {
 	}
 }
 
-// ── Шифрованный BT через VLESS: живой access.log [EE] #29, 20 окт 2026 ──────
-// qBittorrent 5.3 (email 4) — MSE/PE, xray отправил всё в DIRECT. Ловим разлётом.
+// ── Детектор торрент-юзеров: живой access.log [EE] #29, 20 окт 2026 ──────────
 func resetFanout() {
 	fanoutMu.Lock()
-	fanoutPeers = map[string]map[string]time.Time{}
+	fanoutUsers = map[string]*fanoutUser{}
 	fanoutSrc = map[string]map[string]time.Time{}
 	fanoutMu.Unlock()
 }
 
-func feedLine(line string, now time.Time) (bool, int, bool) {
-	return fanoutObserve(extractClientIPFromLine(line), extractEmailFromLine(line), extractDestFromLine(line), now)
+func feedLine(line string, now time.Time) fanoutVerdict {
+	return fanoutObserve(extractClientIPFromLine(line), extractEmailFromLine(line), extractDestFromLine(line), lineOutboundTag(line), now)
 }
 
-func TestPeerFanoutEstoniaCapture(t *testing.T) {
+const pcLine = "2026/10/20 20:09:05.320208 from 37.230.148.112:%d accepted tcp:%s [VLESS_TCP_TLS_EE3_443_clone >> DIRECT] email: 4"
+
+// Шифрованный qBittorrent: только DIRECT, без подтверждений → бан по второму разлёту.
+func TestFanoutEncryptedNeedsRepeat(t *testing.T) {
 	resetBypass()
 	resetFanout()
 	t0 := time.Date(2026, 10, 20, 20, 9, 5, 0, time.UTC)
-	const tpl = "2026/10/20 20:09:05.320208 from 37.230.148.112:%d accepted tcp:%s [VLESS_TCP_TLS_EE3_443_clone >> DIRECT] email: 4"
-
-	// Живые пиры из лога, дальше — синтетические до порога.
-	peers := []string{"150.241.75.195:24581", "204.168.222.77:33204", "223.185.37.81:7210",
+	live := []string{"150.241.75.195:24581", "204.168.222.77:33204", "223.185.37.81:7210",
 		"95.214.13.140:47335", "178.163.16.130:11720", "172.111.38.128:36709", "195.82.25.249:2279"}
-	for i := len(peers); i < fanoutThresh; i++ {
-		peers = append(peers, fmt.Sprintf("81.%d.%d.7:%d", i/200, i%200, 10000+i))
-	}
-	var hit, shared bool
-	var n int
-	for i, p := range peers {
-		hit, n, shared = feedLine(fmt.Sprintf(tpl, 50000+i, p), t0.Add(time.Duration(i)*time.Second))
-		if hit && i < fanoutThresh-1 {
-			t.Fatalf("сработало рано: %d пиров", n)
-		}
-	}
-	if !hit || shared {
-		t.Fatalf("торрент-юзер не пойман: hit=%v n=%d shared=%v", hit, n, shared)
-	}
-
-	// Телефон за тем же NAT (email 3): сайты по доменам, повторы — не в счёт.
-	resetFanout()
-	for i := 0; i < 200; i++ {
-		l := fmt.Sprintf("2026/10/20 20:09:30.360324 from 37.230.148.112:%d accepted tcp:v16m.tiktokcdn.com:443 [VLESS_TCP_TLS_EE3_443_clone >> DIRECT] email: 3", 33000+i)
-		if h, _, _ := feedLine(l, t0); h {
-			t.Fatal("НЕБЕЗОПАСНО: обычный браузинг по доменам сработал")
-		}
-	}
-	// Не считаются: стандартные порты, DNS, приватные адреса, повтор одного пира.
-	for i := 0; i < 100; i++ {
-		for _, d := range []string{fmt.Sprintf("tcp:149.154.162.%d:443", i), fmt.Sprintf("tcp:149.154.162.%d:80", i),
-			fmt.Sprintf("udp:1.1.%d.1:53", i), fmt.Sprintf("tcp:10.0.0.%d:30000", i), "tcp:45.195.221.81:8888"} {
-			l := "from 176.52.79.221:50656 accepted " + d + " [VLESS_TCP_TLS_EE3_443_clone >> DIRECT] email: 13"
-			if h, _, _ := feedLine(l, t0); h {
-				t.Fatalf("НЕБЕЗОПАСНО: сработало на %s", d)
+	feed := func(round, n int) (v fanoutVerdict, at int) {
+		for i := 0; i < n; i++ {
+			p := fmt.Sprintf("81.%d.%d.7:%d", round, i, 10000+round*100+i)
+			if round == 0 && i < len(live) {
+				p = live[i]
+			}
+			v = feedLine(fmt.Sprintf(pcLine, 50000+i, p), t0.Add(time.Duration(round*60+i)*time.Second))
+			if v.Ban {
+				return v, i
 			}
 		}
+		return v, -1
 	}
-
-	// Окно: 29 пиров, потом пауза > окна — счётчик обнуляется.
-	resetFanout()
-	for i := 0; i < fanoutThresh-1; i++ {
-		feedLine(fmt.Sprintf(tpl, 40000+i, fmt.Sprintf("82.0.%d.9:20000", i)), t0)
+	if v, at := feed(0, fanoutThresh); v.Ban {
+		t.Fatalf("первый разлёт без подтверждения не должен банить (сработало на %d): %+v", at, v)
 	}
-	if h, _, _ := feedLine(fmt.Sprintf(tpl, 1, "82.1.1.9:20000"), t0.Add(fanoutWindow+time.Minute)); h {
-		t.Error("старые пиры за окном не должны учитываться")
+	v, at := feed(1, fanoutThresh)
+	if !v.Ban || v.Shared || v.ClientIP != "37.230.148.112" {
+		t.Fatalf("второй разлёт за 15 мин должен банить: %+v (at=%d)", v, at)
 	}
 }
 
-// Мост/релей: за одним IP источника много юзеров — IP не баним никогда.
-func TestPeerFanoutSharedSourceNotBanned(t *testing.T) {
+// uFiler/MediaGet: xray сам отправил пиров в BLOCK → 3 подтверждения = бан сразу.
+func TestFanoutXrayBlackholeConfirms(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	t0 := time.Now()
+	blk := "20:24:10.643204 from 37.230.148.112:%d accepted tcp:%s [VLESS_TCP_TLS_EE3_443_clone -> BLOCK] email: 4"
+	peers := []string{"150.241.75.195:24581", "23.158.56.119:3879", "157.173.111.162:9999"}
+	var v fanoutVerdict
+	for i, p := range peers {
+		v = feedLine(fmt.Sprintf(blk, 45819+i, p), t0)
+	}
+	if !v.Ban || v.Confirmed != 3 {
+		t.Fatalf("3 пира в BLOCK — бан: %+v", v)
+	}
+	// BLOCK рекламы (домен), SMTP (25) и приватных — не подтверждение.
+	resetFanout()
+	for i, d := range []string{"tcp:ads.example.com:443", "tcp:8.8.8.8:25", "tcp:10.1.2.3:40000", "tcp:1.1.1.1:443"} {
+		if v := feedLine(fmt.Sprintf("from 9.9.9.9:%d accepted %s [x -> BLOCK] email: 7", i, d), t0); v.Ban || v.Confirmed > 0 {
+			t.Fatalf("НЕБЕЗОПАСНО: %s засчитан как торрент: %+v", d, v)
+		}
+	}
+}
+
+// DPI поймал пиров (ipset auto_peers) → их собеседник подтверждён.
+func TestFanoutDPIConfirms(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	t0 := time.Now()
+	caught := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		ip := fmt.Sprintf("83.9.88.%d", 10+i)
+		feedLine(fmt.Sprintf(pcLine, 100+i, ip+":13070"), t0)
+		if i < 3 {
+			caught[ip] = true
+		}
+	}
+	vs := fanoutConfirmPeers(caught, t0.Add(10*time.Second))
+	if len(vs) != 1 || !vs[0].Ban || vs[0].ClientIP != "37.230.148.112" {
+		t.Fatalf("3 пира из auto_peers должны дать бан: %+v", vs)
+	}
+}
+
+// Karagiannis: один пир и по TCP, и по UDP.
+func TestFanoutTCPUDPPair(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	t0 := time.Now()
+	var v fanoutVerdict
+	for i := 0; i < 3; i++ {
+		ip := fmt.Sprintf("46.187.88.%d", 30+i)
+		feedLine(fmt.Sprintf("from 37.230.148.112:%d accepted tcp:%s:10786 [x >> DIRECT] email: 4", i, ip), t0)
+		v = feedLine(fmt.Sprintf("from 37.230.148.112:%d accepted udp:%s:10786 [x >> DIRECT] email: 4", i, ip), t0)
+	}
+	if !v.Ban {
+		t.Fatalf("3 пира TCP+UDP — бан: %+v", v)
+	}
+}
+
+// Легальное: домены, стандартные порты, звонки/STUN, Windows DO, повтор пира,
+// много IP на ОДНОМ порту (нет разлёта по портам).
+func TestFanoutLegitNotBanned(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	t0 := time.Now()
+	dests := []string{}
+	for i := 0; i < 200; i++ {
+		dests = append(dests,
+			"tcp:v16m.tiktokcdn.com:443",
+			fmt.Sprintf("tcp:149.154.162.%d:443", i%250),
+			fmt.Sprintf("udp:1.1.%d.1:53", i%250),
+			fmt.Sprintf("udp:74.125.%d.127:19302", i%250), // Google STUN
+			fmt.Sprintf("udp:162.159.%d.1:3478", i%250),   // TURN/Discord
+			fmt.Sprintf("tcp:20.%d.1.1:7680", i%250),      // Windows Delivery Optimization
+			fmt.Sprintf("udp:155.133.%d.20:27020", i%250), // Steam
+			fmt.Sprintf("tcp:52.%d.3.4:9000", i%250),      // 200 IP, но один порт
+			"tcp:45.195.221.81:8888",
+		)
+	}
+	for i, d := range dests {
+		l := fmt.Sprintf("from 176.52.79.221:%d accepted %s [x >> DIRECT] email: 13", i, d)
+		if v := feedLine(l, t0.Add(time.Duration(i)*time.Millisecond)); v.Ban {
+			t.Fatalf("НЕБЕЗОПАСНО: легальный трафик забанен на %s: %+v", d, v)
+		}
+	}
+}
+
+// Мост/релей: за одним IP ≥3 юзеров — IP не баним никогда.
+func TestFanoutSharedSourceNotBanned(t *testing.T) {
 	resetBypass()
 	resetFanout()
 	t0 := time.Now()
@@ -490,11 +553,35 @@ func TestPeerFanoutSharedSourceNotBanned(t *testing.T) {
 	for _, e := range []string{"11", "12"} {
 		feedLine("from "+bridge+":1 accepted tcp:ya.ru:443 [x >> DIRECT] email: "+e, t0)
 	}
-	var hit, shared bool
-	for i := 0; i < fanoutThresh; i++ {
-		hit, _, shared = feedLine(fmt.Sprintf("from %s:%d accepted tcp:83.%d.0.1:%d [x >> DIRECT] email: 10", bridge, i, i, 6881+i), t0)
+	var v fanoutVerdict
+	for i := 0; i < 3; i++ {
+		v = feedLine(fmt.Sprintf("from %s:%d accepted tcp:83.%d.0.1:%d [x -> BLOCK] email: 10", bridge, i, i, 6881+i), t0)
 	}
-	if !hit || !shared {
-		t.Fatalf("за мостом 3 юзера: ожидали hit=true shared=true, есть hit=%v shared=%v", hit, shared)
+	if !v.Ban || !v.Shared {
+		t.Fatalf("за мостом 3 юзера: ожидали Ban+Shared, есть %+v", v)
+	}
+}
+
+// --confirm-peers 0 выключает только бан по подтверждениям, а не банит всех.
+func TestFanoutConfirmDisabled(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	old := fanoutConfirmNeed
+	fanoutConfirmNeed = 0
+	defer func() { fanoutConfirmNeed = old }()
+	if v := feedLine(fmt.Sprintf(pcLine, 1, "83.9.88.161:13070"), time.Now()); v.Ban {
+		t.Fatalf("один пир при --confirm-peers 0 забанен: %+v", v)
+	}
+}
+
+func TestLineOutboundTag(t *testing.T) {
+	for line, want := range map[string]string{
+		"from 1.2.3.4:5 accepted tcp:x:1 [VLESS_TCP_TLS_EE3_443_clone -> BLOCK] email: 4":  "BLOCK",
+		"from 1.2.3.4:5 accepted tcp:x:1 [VLESS_TCP_TLS_EE3_443_clone >> DIRECT] email: 4": "DIRECT",
+		"from 1.2.3.4:5 accepted tcp:x:1 [vless-443 >> TORRENT] email: user42":             "TORRENT",
+	} {
+		if got := lineOutboundTag(line); got != want {
+			t.Errorf("тег %q, ожидали %q", got, want)
+		}
 	}
 }

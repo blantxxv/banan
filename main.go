@@ -739,26 +739,76 @@ func isDomainTorrent(dest string) bool {
 	return false
 }
 
-// ── Разлёт по пирам: шифрованный BT по access.log ───────────────────────────
+// ── Детектор торрент-юзеров по access.log ────────────────────────────────────
 //
-// Живой тест 20 окт 2026, qBittorrent 5.3 через VLESS на [EE] #29: все пиры
-// шли по TCP с MSE/PE-шифрованием — sniffing xray их не распознал (правило
-// bittorrent→BLOCK не сработало ни разу, всё ушло в DIRECT), DPI тоже слеп.
-// Зато в access.log за 4.5 мин у этого юзера 75 разных IP на высоких портах,
-// у остальных юзеров ноды — 1–2. Считаем ПО EMAIL, а не по IP источника:
-// старые netstat-эвристики банили мосты именно потому, что считали по IP.
-// Источник, за которым видно ≥ fanoutSharedEmails юзеров (мост/релей/NAT),
-// не баним — только пишем в лог.
+// Живые тесты 20 окт 2026 на [EE] #29 (VLESS): qBittorrent 5.3 шифрует пиров
+// (MSE/PE) — sniffing xray и DPI их не видят; uFiler/MediaGet качают по uTP,
+// а UDP в access.log почти не попадает. Поэтому юзера выдаёт поведение, и мы
+// собираем несколько независимых признаков (идеи fsnt-torrent-blocker,
+// Ezhik Torrent Guard, Karagiannis et al. IMC'04):
+//
+//  1. Разлёт: за окно ≥ fanoutThresh разных голых IP И ≥ fanoutPortThresh
+//     разных портов (у P2P у каждого пира свой порт, у веба всё на 443).
+//     Порты легального разлёта (STUN/TURN, P2P обновлений Windows, пуши,
+//     Zoom, Steam) в счёт не идут.
+//  2. Подтверждённые пиры: xray уже распознал bittorrent и отправил в
+//     blackhole (строка "-> BLOCK" на голый публичный IP:порт>1024 — реклама
+//     идёт по доменам, SMTP на 25, приватные отсечены); IP из auto_peers
+//     (DPI поймал DHT/uTP/хендшейк к нему); один и тот же пир по TCP и по UDP.
+//  3. Повтор: без подтверждения бан только по второму срабатыванию разлёта
+//     за fanoutRepeatWindow — одиночный всплеск не банит.
+//
+// Счёт ПО EMAIL, а не по IP источника (старые netstat-эвристики считали по IP
+// и банили мосты). Если за IP источника видно ≥ fanoutSharedEmails юзеров
+// (мост/релей/NAT), IP не баним — только лог. Наказание — banIP на banDuration.
 var (
-	fanoutThresh = 30
-	fanoutWindow = 5 * time.Minute
-	fanoutMu     sync.Mutex
-	fanoutPeers  = map[string]map[string]time.Time{} // юзер → IP пира → когда видели
-	fanoutSrc    = map[string]map[string]time.Time{} // IP источника → email → когда видели
-	fanoutCalls  int
+	fanoutThresh       = 30
+	fanoutPortThresh   = 20
+	fanoutWindow       = 5 * time.Minute
+	fanoutRepeatWindow = 15 * time.Minute
+	fanoutConfirmNeed  = 3 // столько подтверждённых пиров = торрент без разлёта
+	blackholeTags      = []string{"BLOCK", "block", "blackhole", "RW_TB_OUTBOUND_BLOCK"}
+
+	fanoutMu    sync.Mutex
+	fanoutUsers = map[string]*fanoutUser{}
+	fanoutSrc   = map[string]map[string]time.Time{} // IP источника → email → когда видели
+	fanoutCalls int
 )
 
 const fanoutSharedEmails = 3
+
+// Порты, которые дают легальный разлёт по голым IP.
+var fanoutIgnorePorts = [][2]int{
+	{3478, 3497},   // STUN/TURN: звонки, Discord, WebRTC
+	{5349, 5349},   // TURN/TLS
+	{19302, 19309}, // Google STUN
+	{7680, 7680},   // Delivery Optimization — P2P обновлений Windows
+	{5222, 5223},   // XMPP/WhatsApp, Apple push
+	{5228, 5230},   // Google push
+	{8801, 8810},   // Zoom
+	{27015, 27050}, // Steam
+}
+
+type fanoutUser struct {
+	clientIP  string
+	peers     map[string]time.Time // IP пира → когда видели
+	ports     map[string]time.Time // порт пира → когда видели
+	tcpPeers  map[string]time.Time
+	udpPeers  map[string]time.Time
+	confirmed map[string]time.Time // подтверждённые торрент-пиры
+	hits      []time.Time          // срабатывания разлёта
+}
+
+// fanoutVerdict — решение по юзеру. Ban=true: банить clientIP (если не Shared).
+type fanoutVerdict struct {
+	Ban          bool
+	Shared       bool
+	Key          string
+	ClientIP     string
+	Hosts, Ports int
+	Confirmed    int
+	Reason       string
+}
 
 func extractEmailFromLine(line string) string {
 	fields := strings.Fields(line)
@@ -770,21 +820,46 @@ func extractEmailFromLine(line string) string {
 	return ""
 }
 
-// fanoutPeerIP: назначение — голый публичный IP на порту >1024, не из vpnPorts.
-// Домены (сайты, CDN) и стандартные порты в счёт не идут.
-func fanoutPeerIP(dest string) string {
-	d := strings.TrimPrefix(strings.TrimPrefix(dest, "tcp:"), "udp:")
+// lineOutboundTag: тег аутбаунда из "[inbound >> TAG]" / "[inbound -> TAG]".
+func lineOutboundTag(line string) string {
+	for _, sep := range []string{" >> ", " -> "} {
+		if i := strings.Index(line, sep); i >= 0 {
+			rest := line[i+len(sep):]
+			if j := strings.IndexByte(rest, ']'); j >= 0 {
+				return rest[:j]
+			}
+		}
+	}
+	return ""
+}
+
+func fanoutPortIgnored(p int) bool {
+	for _, r := range fanoutIgnorePorts {
+		if p >= r[0] && p <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// fanoutPeer: назначение — голый публичный IP на порту >1024, не из vpnPorts
+// и не из портов легального разлёта. Домены (сайты, CDN) в счёт не идут.
+func fanoutPeer(dest string) (proto, ip, port string) {
+	proto = "tcp"
+	d := dest
+	if strings.HasPrefix(d, "udp:") {
+		proto = "udp"
+	}
+	d = strings.TrimPrefix(strings.TrimPrefix(d, "tcp:"), "udp:")
 	host, port, err := net.SplitHostPort(d)
 	if err != nil || net.ParseIP(host) == nil || vpnPorts[port] {
-		return ""
+		return "", "", ""
 	}
-	if p, err := strconv.Atoi(port); err != nil || p <= 1024 {
-		return ""
+	p, err := strconv.Atoi(port)
+	if err != nil || p <= 1024 || fanoutPortIgnored(p) || isProtectedIP(host) {
+		return "", "", ""
 	}
-	if isProtectedIP(host) {
-		return ""
-	}
-	return host
+	return proto, host, port
 }
 
 func pruneSeen(m map[string]time.Time, cutoff time.Time) {
@@ -795,55 +870,207 @@ func pruneSeen(m map[string]time.Time, cutoff time.Time) {
 	}
 }
 
-// fanoutObserve учитывает строку access.log. hit — юзер достиг порога,
-// shared — его источник общий (мост/NAT), банить IP нельзя.
-func fanoutObserve(clientIP, email, dest string, now time.Time) (hit bool, n int, shared bool) {
+func isBlackholeTag(tag string) bool {
+	for _, t := range blackholeTags {
+		if tag == t {
+			return true
+		}
+	}
+	return false
+}
+
+func fanoutUserFor(key, clientIP string) *fanoutUser {
+	u := fanoutUsers[key]
+	if u == nil {
+		u = &fanoutUser{peers: map[string]time.Time{}, ports: map[string]time.Time{},
+			tcpPeers: map[string]time.Time{}, udpPeers: map[string]time.Time{},
+			confirmed: map[string]time.Time{}}
+		fanoutUsers[key] = u
+	}
+	if clientIP != "" {
+		u.clientIP = clientIP
+	}
+	return u
+}
+
+// fanoutEvaluate — под fanoutMu. Сбрасывает счётчики юзера после бана.
+func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
+	cutoff := now.Add(-fanoutWindow)
+	for _, m := range []map[string]time.Time{u.peers, u.ports, u.tcpPeers, u.udpPeers, u.confirmed} {
+		pruneSeen(m, cutoff)
+	}
+	// Karagiannis: один и тот же пир и по TCP, и по UDP — почти всегда P2P.
+	for ip, t := range u.tcpPeers {
+		if _, ok := u.udpPeers[ip]; ok {
+			u.confirmed[ip] = t
+		}
+	}
+	v := fanoutVerdict{Key: key, ClientIP: u.clientIP, Hosts: len(u.peers), Ports: len(u.ports), Confirmed: len(u.confirmed)}
+
+	spread := fanoutThresh > 0 && v.Hosts >= fanoutThresh && v.Ports >= fanoutPortThresh
+	if spread {
+		u.hits = append(u.hits, now)
+		u.peers, u.ports = map[string]time.Time{}, map[string]time.Time{} // копим заново
+	}
+	rcut := now.Add(-fanoutRepeatWindow)
+	var recent []time.Time
+	for _, t := range u.hits {
+		if !t.Before(rcut) {
+			recent = append(recent, t)
+		}
+	}
+	u.hits = recent
+
+	switch {
+	case fanoutConfirmNeed > 0 && v.Confirmed >= fanoutConfirmNeed:
+		v.Ban, v.Reason = true, fmt.Sprintf("torrent_peers:%d", v.Confirmed)
+	case spread && v.Confirmed > 0:
+		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp+confirmed:%d", v.Hosts, v.Ports, v.Confirmed)
+	case spread && len(u.hits) >= 2:
+		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp x%d/%v", v.Hosts, v.Ports, len(u.hits), fanoutRepeatWindow)
+	}
+	if !v.Ban {
+		return v
+	}
+	if src := fanoutSrc[u.clientIP]; src != nil {
+		pruneSeen(src, cutoff)
+		v.Shared = len(src) >= fanoutSharedEmails
+	}
+	delete(fanoutUsers, key) // после бана копим с нуля
+	return v
+}
+
+// fanoutObserve учитывает строку access.log.
+func fanoutObserve(clientIP, email, dest, tag string, now time.Time) fanoutVerdict {
 	fanoutMu.Lock()
 	defer fanoutMu.Unlock()
-	cutoff := now.Add(-fanoutWindow)
 
 	fanoutCalls++
 	if fanoutCalls%1000 == 0 {
-		for _, mm := range []map[string]map[string]time.Time{fanoutPeers, fanoutSrc} {
-			for k, m := range mm {
-				if pruneSeen(m, cutoff); len(m) == 0 {
-					delete(mm, k)
-				}
-			}
-		}
+		fanoutGC(now)
 	}
-
 	if clientIP != "" && email != "" {
 		if fanoutSrc[clientIP] == nil {
 			fanoutSrc[clientIP] = map[string]time.Time{}
 		}
 		fanoutSrc[clientIP][email] = now
 	}
-	peer := fanoutPeerIP(dest)
-	if peer == "" {
-		return false, 0, false
+	proto, ip, port := fanoutPeer(dest)
+	if ip == "" {
+		return fanoutVerdict{}
 	}
 	key := email
 	if key == "" {
 		key = "ip:" + clientIP
 	}
-	m := fanoutPeers[key]
-	if m == nil {
-		m = map[string]time.Time{}
-		fanoutPeers[key] = m
+	u := fanoutUserFor(key, clientIP)
+	u.peers[ip] = now
+	u.ports[port] = now
+	if proto == "udp" {
+		u.udpPeers[ip] = now
+	} else {
+		u.tcpPeers[ip] = now
 	}
-	m[peer] = now
-	pruneSeen(m, cutoff)
-	n = len(m)
-	if n < fanoutThresh {
-		return false, n, false
+	if isBlackholeTag(tag) {
+		u.confirmed[ip] = now // xray сам распознал bittorrent к этому пиру
 	}
-	delete(fanoutPeers, key) // после срабатывания копим заново
-	if src := fanoutSrc[clientIP]; src != nil {
-		pruneSeen(src, cutoff)
-		shared = len(src) >= fanoutSharedEmails
+	return fanoutEvaluate(key, u, now)
+}
+
+// fanoutConfirmPeers: IP, на которых DPI поймал торрент (ipset auto_peers),
+// подтверждают недавних собеседников этих IP. Возвращает решения на бан.
+func fanoutConfirmPeers(caught map[string]bool, now time.Time) []fanoutVerdict {
+	fanoutMu.Lock()
+	defer fanoutMu.Unlock()
+	var out []fanoutVerdict
+	for key, u := range fanoutUsers {
+		changed := false
+		for ip, t := range u.peers {
+			if caught[ip] {
+				if _, ok := u.confirmed[ip]; !ok {
+					u.confirmed[ip] = t
+					changed = true
+				}
+			}
+		}
+		if changed {
+			if v := fanoutEvaluate(key, u, now); v.Ban {
+				out = append(out, v)
+			}
+		}
 	}
-	return true, n, shared
+	return out
+}
+
+func fanoutGC(now time.Time) {
+	cutoff := now.Add(-fanoutRepeatWindow)
+	for k, u := range fanoutUsers {
+		last := time.Time{}
+		for _, m := range []map[string]time.Time{u.peers, u.confirmed} {
+			for _, t := range m {
+				if t.After(last) {
+					last = t
+				}
+			}
+		}
+		for _, t := range u.hits {
+			if t.After(last) {
+				last = t
+			}
+		}
+		if last.Before(cutoff) {
+			delete(fanoutUsers, k)
+		}
+	}
+	for k, m := range fanoutSrc {
+		if pruneSeen(m, now.Add(-fanoutWindow)); len(m) == 0 {
+			delete(fanoutSrc, k)
+		}
+	}
+}
+
+// fanoutApply: бан по решению детектора (общий источник — только лог).
+func fanoutApply(v fanoutVerdict) {
+	if !v.Ban {
+		return
+	}
+	if v.Shared || v.ClientIP == "" {
+		log.Printf("PEER_FANOUT %s user=%s %s — источник общий (мост/NAT), IP не баню", v.ClientIP, v.Key, v.Reason)
+		return
+	}
+	banIP(v.ClientIP, v.Reason+" user:"+v.Key)
+}
+
+// readCaughtPeers: содержимое ipset auto_peers_v4/v6 (пиры, пойманные DPI).
+func readCaughtPeers() map[string]bool {
+	caught := map[string]bool{}
+	for _, set := range []string{"auto_peers_v4", "auto_peers_v6"} {
+		out, err := exec.Command("ipset", "save", set).Output()
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(string(out), "\n") {
+			f := strings.Fields(l)
+			if len(f) >= 3 && f[0] == "add" {
+				caught[f[2]] = true
+			}
+		}
+	}
+	return caught
+}
+
+func startPeerConfirmMonitor() {
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			if fanoutConfirmNeed <= 0 {
+				continue
+			}
+			for _, v := range fanoutConfirmPeers(readCaughtPeers(), time.Now()) {
+				fanoutApply(v)
+			}
+		}
+	}()
 }
 
 // isTrackerHost: HTTPS-трекер по имени (tracker.se7en.ws, tracker2.x.org,
@@ -910,16 +1137,8 @@ func monitorLog(path string) {
 					banIP(cip, "domain_torrent:"+dest)
 				}
 			}
-			if fanoutThresh > 0 && dest != "" {
-				cip := extractClientIPFromLine(line)
-				email := extractEmailFromLine(line)
-				if hit, n, shared := fanoutObserve(cip, email, dest, time.Now()); hit {
-					if shared || cip == "" {
-						log.Printf("PEER_FANOUT %s email=%s: %d пиров за %v — источник общий (мост/NAT), IP не баню", cip, email, n, fanoutWindow)
-					} else {
-						banIP(cip, fmt.Sprintf("peer_fanout:%d/%v user:%s", n, fanoutWindow, email))
-					}
-				}
+			if dest != "" {
+				fanoutApply(fanoutObserve(extractClientIPFromLine(line), extractEmailFromLine(line), dest, lineOutboundTag(line), time.Now()))
 			}
 			continue
 		}
@@ -1487,6 +1706,20 @@ func main() {
 				}
 				i++
 			}
+		case "--fanout-ports":
+			if i+1 < len(os.Args) {
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					fanoutPortThresh = n
+				}
+				i++
+			}
+		case "--confirm-peers":
+			if i+1 < len(os.Args) {
+				if n, err := strconv.Atoi(os.Args[i+1]); err == nil {
+					fanoutConfirmNeed = n
+				}
+				i++
+			}
 		case "--netstat":
 			// осознанное включение эвристик по числу соединений (см. предупреждение выше)
 			enableNetstat = true
@@ -1565,6 +1798,7 @@ func main() {
 	portRules := applyPortBlock()
 	dpiRules := applyDPI()
 	startLogMonitor()
+	startPeerConfirmMonitor()
 	startNetstatMonitor()
 	startCleanupRoutine()
 
