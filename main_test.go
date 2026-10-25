@@ -855,3 +855,34 @@ func TestReportUserBan(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+// Служебные домены клиента и сайты трекеров — без бана; DHT, анонсы и пиры — бан.
+func TestTorrentBanworthy(t *testing.T) {
+	for dest, want := range map[string]bool{
+		"tcp:update.utorrent.com:443":     false,
+		"tcp:co.bt.co:443":                false,
+		"tcp:ledger.bt.co:443":            false,
+		"tcp:www.qbittorrent.org:443":     false,
+		"tcp:rutracker.org:443":           false,
+		"tcp:bench.utorrent.com:443":      false,
+		"udp:router.bittorrent.com:6881":  true,
+		"udp:router.utorrent.com:6881":    true,
+		"udp:dht.transmissionbt.com:6881": true,
+		"tcp:bt2.t-ru.org:80":             true,
+		"tcp:tracker.se7en.ws:443":        true,
+		"udp:tracker.opentrackr.org:1337": true,
+		"udp:open.stealth.si:80":          true,
+		"udp:82.221.103.244:6881":         true,
+	} {
+		if got := torrentBanworthy(dest, false); got != want {
+			t.Errorf("без тега %s: %v, ожидали %v", dest, got, want)
+		}
+	}
+	// с тегом TORRENT (geosite трекеров) — банить, кроме сайтов и служебных
+	if !torrentBanworthy("tcp:tracker.unknown-example.net:443", true) {
+		t.Error("тег TORRENT на трекер должен банить")
+	}
+	if torrentBanworthy("tcp:update.utorrent.com:443", true) {
+		t.Error("тег TORRENT на update.utorrent.com не должен банить")
+	}
+}

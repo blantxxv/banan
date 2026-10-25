@@ -724,6 +724,78 @@ func extractClientIPFromLine(line string) string {
 	return ""
 }
 
+// ── Бан по домену: только P2P-эндпоинты ─────────────────────────────────────
+//
+// Служебные домены клиентов (обновления, телеметрия, сайт) и сайты трекеров в
+// браузере правилами xray блокируются, но это не P2P: IP ноды в рое не светится.
+// Банить за них — бить клиента с uTorrent в автозагрузке (живой случай 26.10:
+// 5 банов за update.utorrent.com / co.bt.co без единого пира). Баним только за
+// DHT-бутстрап, анонсы на трекеры и пиров.
+var torrentServiceDomains = []string{
+	"bt.co", "utorrent.com", "bittorrent.com", "qbittorrent.org", "transmissionbt.com",
+	"deluge-torrent.org", "vuze.com", "biglybt.com", "tixati.com", "bitcomet.com",
+	"webtorrent.io", "mediaget.com", "ufiler.pro", "frostwire.com", "bitlord.com",
+}
+
+// Сайты трекеров — в браузере на 80/443 это не P2P; анонсы у них на других хостах.
+var torrentSiteDomains = []string{
+	"rutracker.org", "rutor.info", "thepiratebay.org", "1337x.to", "nyaa.si",
+	"kinozal.tv", "nnmclub.to", "rarbg.to", "yggtorrent.top", "torrentgalaxy.to",
+	"limetorrents.lol", "eztv.re", "fast-torrent.ru", "tapochek.net",
+}
+
+// Явные трекеры для анонсов на 80/443 (HTTPS/HTTP-трекеры).
+var torrentAnnounceDomains = []string{
+	"t-ru.org", // анонсы rutracker: bt.t-ru.org, bt2.t-ru.org…
+	"opentrackr.org", "se7en.ws", "7launcher.com", "7launcher.ru", "nanoha.org",
+	"explodie.org", "tracker.files.fm",
+}
+
+func hostSuffixIn(host string, list []string) bool {
+	for _, d := range list {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
+}
+
+// dhtBootstrapHost: router.bittorrent.com, router.utorrent.com, dht.transmissionbt.com…
+func dhtBootstrapHost(host string) bool {
+	return strings.HasPrefix(host, "router.") || strings.HasPrefix(host, "dht.")
+}
+
+// torrentBanworthy: домен — P2P-эндпоинт, за который банить (не сайт и не телеметрия).
+// tagged=true — xray уже пометил строку тегом TORRENT (geosite трекеров или
+// правило по домену): доверяем ему, кроме служебных доменов и сайтов.
+func torrentBanworthy(dest string, tagged bool) bool {
+	d := strings.TrimPrefix(strings.TrimPrefix(dest, "tcp:"), "udp:")
+	host, port, err := net.SplitHostPort(d)
+	if err != nil {
+		host = d
+	}
+	host = strings.ToLower(host)
+	if net.ParseIP(host) != nil {
+		return true // голый IP пира
+	}
+	if dhtBootstrapHost(host) && hostSuffixIn(host, torrentServiceDomains) {
+		return true
+	}
+	if hostSuffixIn(host, torrentAnnounceDomains) {
+		return true
+	}
+	// веб — TCP 80/443 и QUIC (UDP 443); UDP 80 — это UDP-трекер (open.stealth.si:80)
+	web := port == "" || port == "443" || (port == "80" && !strings.HasPrefix(dest, "udp:"))
+	if hostSuffixIn(host, torrentServiceDomains) || (web && hostSuffixIn(host, torrentSiteDomains)) {
+		return false
+	}
+	if tagged {
+		return true
+	}
+	// без тега: на веб-портах только явные трекеры (выше); нестандартный порт — анонс
+	return !web && isDomainTorrent(dest)
+}
+
 func isDomainTorrent(dest string) bool {
 	dest = strings.TrimPrefix(dest, "tcp:")
 	dest = strings.TrimPrefix(dest, "udp:")
@@ -1209,7 +1281,7 @@ func monitorLog(path string) {
 				// сначала учесть строку: punish() проверяет, общий ли источник
 				fanoutApply(fanoutObserve(extractClientIPFromLine(line), extractEmailFromLine(line), dest, lineOutboundTag(line), time.Now()))
 			}
-			if dest != "" && isDomainTorrent(dest) {
+			if dest != "" && isDomainTorrent(dest) && torrentBanworthy(dest, false) {
 				cip := extractClientIPFromLine(line)
 				em := extractEmailFromLine(line)
 				if (cip != "" && !isProtectedIP(cip)) || banableUser(em) {
@@ -1223,7 +1295,9 @@ func monitorLog(path string) {
 		if clientIP != "" && email != "" {
 			fanoutObserve(clientIP, email, "", torrentTag, time.Now()) // только учёт источника
 		}
-		if (clientIP != "" && !isProtectedIP(clientIP)) || banableUser(email) {
+		if destAddr != "" && !torrentBanworthy(destAddr, true) {
+			// сайт или служебный домен клиента: xray его и так режет, но это не P2P
+		} else if (clientIP != "" && !isProtectedIP(clientIP)) || banableUser(email) {
 			reason := "xray_tag:" + torrentTag
 			if email != "" {
 				reason += " user:" + email
