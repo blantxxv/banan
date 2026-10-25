@@ -19,7 +19,8 @@ import (
 // приёмник (--report-url) сам решает, что делать с повторами.
 // Здесь только отправка.
 var (
-	reportURL       = "" // --report-url; пусто — не отправлять
+	reportURL       = ""                  // --report-url; пусто — не отправлять
+	reportURLCtr    = map[string]string{} // --report-url-ctr контейнер=URL (машина с несколькими панелями)
 	reportTokenFile = "/etc/torrent-blocker/report.token"
 	reportHost, _   = os.Hostname()
 
@@ -44,8 +45,13 @@ func reportToken() string {
 }
 
 // reportUserBan — асинхронно, 3 попытки; блокер от сети приёмника не зависит.
-func reportUserBan(email, reason string) {
-	if reportURL == "" || !banableUser(email) {
+func reportUserBan(key, reason string) {
+	ctr, email := splitKey(key)
+	url := reportURL
+	if u, ok := reportURLCtr[ctr]; ok {
+		url = u // "" — не отправлять для этого контейнера
+	}
+	if url == "" || !banableUser(key) {
 		return
 	}
 	body, _ := json.Marshal(banReport{UserID: email, Node: reportHost, Reason: reason, TS: time.Now().Unix()})
@@ -56,7 +62,7 @@ func reportUserBan(email, reason string) {
 			if i > 0 {
 				time.Sleep(time.Duration(i*10) * time.Second)
 			}
-			req, err := http.NewRequest("POST", reportURL, bytes.NewReader(body))
+			req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 			if err != nil {
 				last = err
 				break

@@ -62,8 +62,68 @@ type userBan struct {
 	Entries []userBanEntry `json:"entries"`
 }
 
+// Ключ юзера «контейнер|email»: на машине с несколькими xray разных панелей
+// (remnanode + ee-node) id юзеров пересекаются — бан и отчёт идут только в тот
+// контейнер, из лога которого пришла строка. На обычной ноде ключ = email.
+func scopeKey(ctr, email string) string {
+	if ctr == "" || email == "" {
+		return email
+	}
+	return ctr + "|" + email
+}
+
+func splitKey(key string) (ctr, email string) {
+	if i := strings.IndexByte(key, '|'); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return "", key
+}
+
+// logCtr: путь лога → контейнер; заполняется, только если xray-контейнеров >1.
+var (
+	logCtrMu sync.RWMutex
+	logCtr   = map[string]string{}
+)
+
+func logScope(path string) string {
+	logCtrMu.RLock()
+	defer logCtrMu.RUnlock()
+	return logCtr[path]
+}
+
+// bindLogsToContainers: сопоставить --log с контейнерами по монтированию
+// /var/log/remnanode. Нужен, когда на машине больше одного xray.
+func bindLogsToContainers() {
+	if xrayContainer != "" {
+		return
+	}
+	ctrs := xrayContainers()
+	if len(ctrs) < 2 {
+		return
+	}
+	m := map[string]string{}
+	for _, c := range ctrs {
+		out, err := exec.Command("docker", "inspect", "-f",
+			`{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}`, c).Output()
+		src := strings.TrimRight(strings.TrimSpace(string(out)), "/")
+		if err != nil || src == "" {
+			continue
+		}
+		for _, p := range logFiles {
+			if i := strings.LastIndexByte(p, '/'); i > 0 && p[:i] == src {
+				m[p] = c
+			}
+		}
+	}
+	logCtrMu.Lock()
+	logCtr = m
+	logCtrMu.Unlock()
+	log.Printf("несколько xray на машине: логи привязаны к контейнерам %v", m)
+}
+
 // banableUser: реальный юзер панели, а не техпользователь моста и не ключ «ip:…».
-func banableUser(email string) bool {
+func banableUser(key string) bool {
+	_, email := splitKey(key)
 	if email == "" || strings.HasPrefix(email, "ip:") {
 		return false
 	}
@@ -74,7 +134,8 @@ func banableUser(email string) bool {
 
 // techUser: email из списка техюзеров (в отличие от !banableUser, пустой
 // email и ключ «ip:…» техюзером не считаются).
-func techUser(email string) bool {
+func techUser(key string) bool {
+	_, email := splitKey(key)
 	if email == "" || strings.HasPrefix(email, "ip:") {
 		return false
 	}
@@ -333,21 +394,25 @@ func apiFailed(err error) {
 }
 
 // banUser убирает юзера из инбаундов ноды на banDuration. true — забанен.
-func banUser(email, reason string) bool {
-	if !userBanEnabled || !banableUser(email) {
+func banUser(key, reason string) bool {
+	if !userBanEnabled || !banableUser(key) {
 		return false
 	}
+	scope, email := splitKey(key)
 	userBanMu.Lock()
-	if _, ok := userBans[email]; ok {
+	if _, ok := userBans[key]; ok {
 		userBanMu.Unlock()
 		return true
 	}
 	// резерв под бан, чтобы параллельный детектор не запускал второй
-	ub := &userBan{Email: email, Blocked: time.Now(), Until: time.Now().Add(banDuration), Reason: reason}
-	userBans[email] = ub
+	ub := &userBan{Email: key, Blocked: time.Now(), Until: time.Now().Add(banDuration), Reason: reason}
+	userBans[key] = ub
 	userBanMu.Unlock()
 
 	ctrs := xrayContainers()
+	if scope != "" {
+		ctrs = []string{scope} // только контейнер, из лога которого строка
+	}
 	if len(ctrs) == 0 {
 		apiFailed(fmt.Errorf("контейнер с xray API не найден"))
 	}
@@ -386,7 +451,7 @@ func banUser(email, reason string) bool {
 	userBanMu.Lock()
 	n := len(ub.Entries)
 	if n == 0 {
-		delete(userBans, email)
+		delete(userBans, key)
 	}
 	userBanMu.Unlock()
 	saveUserBans()
@@ -394,8 +459,8 @@ func banUser(email, reason string) bool {
 		log.Printf("USER_BAN %s: юзер не найден в инбаундах ноды (skip=%v) — не забанен (%s)", email, skipped, reason)
 		return false
 	}
-	log.Printf("USER_BAN user=%s на %v: убран из %d инбаундов (%s)%s", email, banDuration, n, reason, skippedNote(skipped))
-	reportUserBan(email, reason)
+	log.Printf("USER_BAN user=%s на %v: убран из %d инбаундов (%s)%s", key, banDuration, n, reason, skippedNote(skipped))
+	reportUserBan(key, reason)
 	return true
 }
 
@@ -407,9 +472,10 @@ func skippedNote(s []string) string {
 }
 
 // unbanUser возвращает юзера во все инбаунды, откуда убрали.
-func unbanUser(email string) {
+func unbanUser(key string) {
+	_, email := splitKey(key)
 	userBanMu.Lock()
-	ub := userBans[email]
+	ub := userBans[key]
 	userBanMu.Unlock()
 	if ub == nil {
 		return
@@ -433,14 +499,14 @@ func unbanUser(email string) {
 	}
 	userBanMu.Lock()
 	if len(left) == 0 {
-		delete(userBans, email)
+		delete(userBans, key)
 	} else {
 		ub.Entries = left
 	}
 	userBanMu.Unlock()
 	saveUserBans()
 	if len(left) == 0 {
-		log.Printf("USER_UNBAN user=%s", email)
+		log.Printf("USER_UNBAN user=%s", key)
 	}
 }
 
@@ -450,22 +516,23 @@ func enforceUserBans(now time.Time) {
 	userBanMu.Lock()
 	var expired []string
 	active := map[string][]userBanEntry{}
-	for email, ub := range userBans {
+	for k, ub := range userBans {
 		if now.After(ub.Until) {
-			expired = append(expired, email)
+			expired = append(expired, k)
 		} else {
-			active[email] = append([]userBanEntry(nil), ub.Entries...)
+			active[k] = append([]userBanEntry(nil), ub.Entries...)
 		}
 	}
 	userBanMu.Unlock()
-	for _, email := range expired {
-		unbanUser(email)
+	for _, k := range expired {
+		unbanUser(k)
 	}
 	if len(active) == 0 {
 		return
 	}
 	apis := map[string]*xrayAPI{}
-	for email, entries := range active {
+	for k, entries := range active {
+		_, email := splitKey(k)
 		for _, e := range entries {
 			api, err := cachedAPI(apis, e.Ctr)
 			if err != nil {
@@ -474,7 +541,7 @@ func enforceUserBans(now time.Time) {
 			}
 			if _, ok, _ := api.inboundUser(e.Tag, email); ok {
 				if api.removeUser(e.Tag, email) == nil {
-					log.Printf("USER_BAN user=%s: вернулся в %s раньше срока — убран снова", email, e.Tag)
+					log.Printf("USER_BAN user=%s: вернулся в %s раньше срока — убран снова", k, e.Tag)
 				}
 			}
 		}

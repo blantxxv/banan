@@ -886,3 +886,43 @@ func TestTorrentBanworthy(t *testing.T) {
 		t.Error("тег TORRENT на update.utorrent.com не должен банить")
 	}
 }
+
+// Машина с двумя панелями: ключ «контейнер|email» — техюзер и бан по сырому id,
+// отчёт для чужой панели можно выключить.
+func TestScopedKeys(t *testing.T) {
+	if c, e := splitKey(scopeKey("ee-node", "1001")); c != "ee-node" || e != "1001" {
+		t.Fatalf("split %q %q", c, e)
+	}
+	if scopeKey("", "1001") != "1001" || scopeKey("x", "") != "" {
+		t.Fatal("пустой контейнер/email — ключ без префикса")
+	}
+	setProtectedUsers("9001")
+	defer setProtectedUsers()
+	if !techUser("ee-node|9001") || banableUser("ee-node|9001") || !banableUser("ee-node|1001") {
+		t.Fatal("техюзер должен распознаваться и с префиксом контейнера")
+	}
+	got := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- r.URL.Path + "|" + string(b)
+	}))
+	defer srv.Close()
+	oldU, oldC := reportURL, reportURLCtr
+	reportURL, reportURLCtr = srv.URL+"/a", map[string]string{"ee-node": srv.URL + "/b", "other": ""}
+	defer func() { reportURL, reportURLCtr = oldU, oldC }()
+	reportUserBan("other|1001", "x")   // выключено для контейнера
+	reportUserBan("ee-node|1001", "x") // на свой приёмник, user_id без префикса
+	select {
+	case v := <-got:
+		if !strings.HasPrefix(v, "/b|") || !strings.Contains(v, `"user_id":"1001"`) {
+			t.Fatalf("отчёт %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("отчёт не пришёл")
+	}
+	select {
+	case v := <-got:
+		t.Fatalf("лишний отчёт: %q", v)
+	case <-time.After(300 * time.Millisecond):
+	}
+}

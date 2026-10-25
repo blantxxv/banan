@@ -1236,6 +1236,7 @@ func noteLogOpen(path string, err error) {
 }
 
 func monitorLog(path string) {
+	scope := logScope(path) // контейнер этого лога, если xray на машине несколько
 	f, err := os.Open(path)
 	noteLogOpen(path, err)
 	if err != nil {
@@ -1274,16 +1275,17 @@ func monitorLog(path string) {
 		}
 
 		clientIP, destAddr, email, matched := parseXrayLogLine(line, torrentTag)
+		email = scopeKey(scope, email)
 
 		if !matched {
 			dest := extractDestFromLine(line)
 			if dest != "" {
 				// сначала учесть строку: punish() проверяет, общий ли источник
-				fanoutApply(fanoutObserve(extractClientIPFromLine(line), extractEmailFromLine(line), dest, lineOutboundTag(line), time.Now()))
+				fanoutApply(fanoutObserve(extractClientIPFromLine(line), scopeKey(scope, extractEmailFromLine(line)), dest, lineOutboundTag(line), time.Now()))
 			}
 			if dest != "" && isDomainTorrent(dest) && torrentBanworthy(dest, false) {
 				cip := extractClientIPFromLine(line)
-				em := extractEmailFromLine(line)
+				em := scopeKey(scope, extractEmailFromLine(line))
 				if (cip != "" && !isProtectedIP(cip)) || banableUser(em) {
 					log.Printf("DOMAIN_TORRENT ban %s user=%s (dest=%s)", cip, em, dest)
 					punish(cip, em, "domain_torrent:"+dest+" user:"+em, true)
@@ -1871,6 +1873,14 @@ func main() {
 				reportURL = os.Args[i+1]
 				i++
 			}
+		case "--report-url-ctr":
+			// контейнер=URL; пустой URL — не слать (чужая панель на общей машине)
+			if i+1 < len(os.Args) {
+				if k, v, ok := strings.Cut(os.Args[i+1], "="); ok {
+					reportURLCtr[k] = v
+				}
+				i++
+			}
 		case "--report-token-file":
 			if i+1 < len(os.Args) {
 				reportTokenFile = os.Args[i+1]
@@ -2000,6 +2010,7 @@ func main() {
 	addLocalIPs()
 	loadBypassFile(bypassFile)
 	loadProtectedUsers(protectedUsersFile)
+	bindLogsToContainers()
 
 	cleanup()
 	initBanChain()
