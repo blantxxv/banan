@@ -57,7 +57,7 @@ fi
 if [ -z "${TB_BIN:-}" ]; then
     info "Загрузка исходного кода..."
     TMPDIR=$(mktemp -d)
-    for f in main.go userban.go; do
+    for f in main.go userban.go report.go; do
         curl -fsSL "${REPO}/${f}" -o "${TMPDIR}/${f}"
     done
     ok "исходники скачаны в ${TMPDIR}"
