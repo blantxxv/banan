@@ -666,21 +666,22 @@ func TestFanoutDPIConfirms(t *testing.T) {
 	}
 }
 
-// Karagiannis: один пир и по TCP, и по UDP.
+// Karagiannis: один пир и по TCP, и по UDP (пиры роя — в разных сетях, порты свои).
 func TestFanoutTCPUDPPair(t *testing.T) {
 	resetBypass()
 	resetFanout()
 	t0 := time.Now()
 	var v fanoutVerdict
 	for i := 0; i < 3; i++ {
-		ip := fmt.Sprintf("46.187.88.%d", 30+i)
-		feedLine(fmt.Sprintf("from 11.8.148.112:%d accepted tcp:%s:10786 [x >> DIRECT] email: 4", i, ip), t0)
-		v = feedLine(fmt.Sprintf("from 11.8.148.112:%d accepted udp:%s:10786 [x >> DIRECT] email: 4", i, ip), t0)
+		ip := fmt.Sprintf("46.%d.88.%d", 187+i, 30+i)
+		port := 10786 + i*1013
+		feedLine(fmt.Sprintf("from 11.8.148.112:%d accepted tcp:%s:%d [x >> DIRECT] email: 4", i, ip, port), t0)
+		v = feedLine(fmt.Sprintf("from 11.8.148.112:%d accepted udp:%s:%d [x >> DIRECT] email: 4", i, ip, port), t0)
 	}
 	if !v.Ban {
 		t.Fatalf("3 пира TCP+UDP — бан: %+v", v)
 	}
-	if !strings.Contains(v.Reason, "46.187.88.32:10786/tcp+udp") || strings.Count(v.Reason, "/tcp+udp") != 3 {
+	if !strings.Contains(v.Reason, "46.189.88.32:12812/tcp+udp") || strings.Count(v.Reason, "/tcp+udp") != 3 {
 		t.Fatalf("в причине нет пар TCP+UDP: %q", v.Reason)
 	}
 }
@@ -1107,5 +1108,48 @@ func TestScopedKeys(t *testing.T) {
 	case v := <-got:
 		t.Fatalf("лишний отчёт: %q", v)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Живые случаи 29 окт: «torrent_peers:3» по паре TCP+UDP у клиентов игр и стримов —
+// три сервера облака на одном порту, ферма серверов одной сети, fake-ip TUN клиента.
+func TestServerFarmPeersNotTorrent(t *testing.T) {
+	both := func(email, ip, port string, now time.Time) fanoutVerdict {
+		feedLine(fmt.Sprintf("from 11.8.2.2:1 accepted tcp:%s:%s [x >> DIRECT] email: %s", ip, port, email), now)
+		return feedLine(fmt.Sprintf("from 11.8.2.2:2 accepted udp:%s:%s [x >> DIRECT] email: %s", ip, port, email), now)
+	}
+	cases := []struct {
+		name  string
+		peers [][2]string
+		block string
+		ban   bool
+	}{
+		{"облако игры: разные сети, один порт", [][2]string{{"11.182.153.55", "8210"}, {"11.163.237.14", "8210"}, {"11.36.151.10", "8210"}}, "", false},
+		{"ферма серверов одной сети", [][2]string{{"11.212.196.230", "7684"}, {"11.212.198.26", "7684"}, {"11.212.193.204", "43210"}}, "", false},
+		{"стрим: одна сеть, случайные порты", [][2]string{{"11.232.106.24", "52562"}, {"11.232.106.36", "43873"}, {"11.232.106.37", "31765"}}, "", false},
+		{"fake-ip TUN клиента как block", [][2]string{{"11.153.116.163", "6008"}, {"11.153.43.62", "6006"}}, "198.18.0.1:42370", false},
+		{"рой: разные сети, случайные порты", [][2]string{{"11.31.135.213", "12829"}, {"11.168.5.80", "18626"}, {"11.11.161.33", "37270"}}, "", true},
+		{"рой: разные сети, все на 6881", [][2]string{{"11.41.1.1", "6881"}, {"11.42.2.2", "6881"}, {"11.43.3.3", "6881"}}, "", true},
+	}
+	for _, c := range cases {
+		resetBypass()
+		resetFanout()
+		now := time.Now()
+		var v fanoutVerdict
+		if c.block != "" {
+			v = feedLine(fmt.Sprintf("from 11.8.2.2:3 accepted udp:%s [x >> BLOCK] email: 3001", c.block), now)
+		}
+		for _, p := range c.peers {
+			if v.Ban {
+				break
+			}
+			v = both("3001", p[0], p[1], now)
+		}
+		if v.Ban != c.ban {
+			t.Errorf("%s: ban=%v, ждали %v (%+v)", c.name, v.Ban, c.ban, v)
+		}
+		if c.ban && !strings.HasPrefix(v.Reason, "torrent_peers:3") {
+			t.Errorf("%s: причина %q", c.name, v.Reason)
+		}
 	}
 }
