@@ -335,6 +335,9 @@ func isProtectedIP(ipStr string) bool {
 			ip4[0] == 192 && ip4[1] == 168,     // 192.168.0.0/16
 			ip4[0] == 100 && ip4[1]&0xc0 == 64, // 100.64.0.0/10 (CGNAT)
 			ip4[0] == 169 && ip4[1] == 254,     // link-local
+			ip4[0] == 198 && ip4[1]&0xfe == 18, // 198.18.0.0/15 — fake-ip TUN клиента
+			ip4[0] >= 240,                      // 240.0.0.0/4 — fake-ip, резерв
+			ip4[0] == 0,
 			ip4[0] == 127:
 			return true
 		}
@@ -1036,6 +1039,48 @@ func fanoutPeer(dest string) (proto, ip, port string) {
 	return proto, host, port
 }
 
+// confirmedCount — сколько подтверждённых пиров засчитать. block и dpi — поштучно.
+// Пара TCP+UDP к одному IP — признак P2P, но так же ходят клиенты игр и стримов:
+// к нескольким серверам одной сети или к серверам на одном и том же порту.
+// Поэтому tcp+udp-пиры считаем по сетям (/16, IPv6 — /32), а если все они на
+// одном порту вне BT-диапазона — как одного пира.
+func confirmedCount(u *fanoutUser) int {
+	n := 0
+	nets := map[string]bool{}
+	ports := map[string]bool{}
+	for ip := range u.confirmed {
+		if by := u.confBy[ip]; by == "block" || by == "dpi" {
+			n++
+			continue
+		}
+		nets[peerNet(ip)] = true
+		ports[u.peerPort[ip]] = true
+	}
+	if len(nets) == 0 {
+		return n
+	}
+	if len(ports) == 1 {
+		for p := range ports {
+			if pn, err := strconv.Atoi(p); err != nil || pn < btPortLo || pn > btPortHi {
+				return n + 1
+			}
+		}
+	}
+	return n + len(nets)
+}
+
+// peerNet — сеть пира для confirmedCount: /16 для IPv4, /32 для IPv6.
+func peerNet(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return ipStr
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return fmt.Sprintf("%d.%d", ip4[0], ip4[1])
+	}
+	return fmt.Sprintf("%x", []byte(ip[:4]))
+}
+
 // confirmedPeersNote — до 4 подтверждённых пиров «ip:порт/чем» для причины бана:
 // по ней админ видит, куда ходил клиент (звонок/игра против торрента). Сначала
 // сначала block и dpi, потом пара TCP+UDP; внутри — свежие.
@@ -1156,7 +1201,7 @@ func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 			delete(u.peerPort, ip)
 		}
 	}
-	v := fanoutVerdict{Key: key, ClientIP: u.clientIP, Hosts: len(u.peers), Ports: len(u.ports), Confirmed: len(u.confirmed)}
+	v := fanoutVerdict{Key: key, ClientIP: u.clientIP, Hosts: len(u.peers), Ports: len(u.ports), Confirmed: confirmedCount(u)}
 
 	spread := fanoutThresh > 0 && v.Hosts >= fanoutThresh && v.Ports >= fanoutPortThresh
 	if spread {
