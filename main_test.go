@@ -479,6 +479,9 @@ func TestFanoutXrayBlackholeConfirms(t *testing.T) {
 	if !v.Ban || v.Confirmed != 3 {
 		t.Fatalf("3 пира в BLOCK — бан: %+v", v)
 	}
+	if !strings.Contains(v.Reason, " peers:") || !strings.Contains(v.Reason, "11.17.111.162:9999/block") {
+		t.Fatalf("в причине нет пиров: %q", v.Reason)
+	}
 	// BLOCK рекламы (домен), SMTP (25) и приватных — не подтверждение.
 	resetFanout()
 	for i, d := range []string{"tcp:ads.example.com:443", "tcp:8.8.8.8:25", "tcp:10.1.2.3:40000", "tcp:1.1.1.1:443"} {
@@ -505,6 +508,9 @@ func TestFanoutDPIConfirms(t *testing.T) {
 	if len(vs) != 1 || !vs[0].Ban || vs[0].ClientIP != "11.8.148.112" {
 		t.Fatalf("3 пира из auto_peers должны дать бан: %+v", vs)
 	}
+	if !strings.Contains(vs[0].Reason, "83.9.88.10:13070/dpi") {
+		t.Fatalf("в причине нет пиров DPI: %q", vs[0].Reason)
+	}
 }
 
 // Karagiannis: один пир и по TCP, и по UDP.
@@ -520,6 +526,30 @@ func TestFanoutTCPUDPPair(t *testing.T) {
 	}
 	if !v.Ban {
 		t.Fatalf("3 пира TCP+UDP — бан: %+v", v)
+	}
+	if !strings.Contains(v.Reason, "46.187.88.32:10786/tcp+udp") || strings.Count(v.Reason, "/tcp+udp") != 3 {
+		t.Fatalf("в причине нет пар TCP+UDP: %q", v.Reason)
+	}
+}
+
+// В причине не больше 4 пиров, block и dpi — первыми.
+func TestConfirmedPeersNoteOrder(t *testing.T) {
+	now := time.Now()
+	u := &fanoutUser{confirmed: map[string]time.Time{}, peerPort: map[string]string{}, confBy: map[string]string{}}
+	for i := 0; i < 6; i++ {
+		ip := fmt.Sprintf("11.5.5.%d", i)
+		u.confirmed[ip] = now.Add(time.Duration(i) * time.Second)
+		u.peerPort[ip] = "5000"
+		u.confBy[ip] = "tcp+udp"
+	}
+	u.confBy["11.5.5.0"] = "block"
+	u.confirmed["2001:db8::1"] = now
+	u.peerPort["2001:db8::1"] = "6881"
+	u.confBy["2001:db8::1"] = "dpi"
+	got := confirmedPeersNote(u)
+	want := " peers:11.5.5.0:5000/block,[2001:db8::1]:6881/dpi,11.5.5.5:5000/tcp+udp,11.5.5.4:5000/tcp+udp"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

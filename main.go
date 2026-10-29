@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -888,6 +889,8 @@ type fanoutUser struct {
 	udpPeers  map[string]time.Time
 	confirmed map[string]time.Time // подтверждённые торрент-пиры
 	hits      []time.Time          // срабатывания разлёта
+	peerPort  map[string]string    // IP пира → последний порт (для причины бана)
+	confBy    map[string]string    // IP пира → чем подтверждён: block (xray-правило BLOCK), dpi, tcp+udp
 }
 
 // fanoutVerdict — решение по юзеру. Ban=true: банить clientIP (если не Shared).
@@ -954,6 +957,60 @@ func fanoutPeer(dest string) (proto, ip, port string) {
 	return proto, host, port
 }
 
+// confirmedPeersNote — до 4 подтверждённых пиров «ip:порт/чем» для причины бана:
+// по ней админ видит, куда ходил клиент (звонок/игра против торрента). Сначала
+// сначала block и dpi, потом пара TCP+UDP; внутри — свежие.
+func confirmedPeersNote(u *fanoutUser) string {
+	type pr struct {
+		ip  string
+		t   time.Time
+		rnk int
+	}
+	var ps []pr
+	for ip, t := range u.confirmed {
+		r := 2
+		switch u.confBy[ip] {
+		case "block":
+			r = 0
+		case "dpi":
+			r = 1
+		}
+		ps = append(ps, pr{ip, t, r})
+	}
+	sort.Slice(ps, func(i, j int) bool {
+		if ps[i].rnk != ps[j].rnk {
+			return ps[i].rnk < ps[j].rnk
+		}
+		if !ps[i].t.Equal(ps[j].t) {
+			return ps[i].t.After(ps[j].t)
+		}
+		return ps[i].ip < ps[j].ip
+	})
+	if len(ps) == 0 {
+		return ""
+	}
+	var parts []string
+	for i, p := range ps {
+		if i == 4 {
+			break
+		}
+		host := p.ip
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		by := u.confBy[p.ip]
+		if by == "" {
+			by = "?"
+		}
+		port := u.peerPort[p.ip]
+		if port == "" {
+			port = "?"
+		}
+		parts = append(parts, host+":"+port+"/"+by)
+	}
+	return " peers:" + strings.Join(parts, ",")
+}
+
 func pruneSeen(m map[string]time.Time, cutoff time.Time) {
 	for k, t := range m {
 		if t.Before(cutoff) {
@@ -976,7 +1033,7 @@ func fanoutUserFor(key, clientIP string) *fanoutUser {
 	if u == nil {
 		u = &fanoutUser{peers: map[string]time.Time{}, ports: map[string]time.Time{},
 			tcpPeers: map[string]time.Time{}, udpPeers: map[string]time.Time{},
-			confirmed: map[string]time.Time{}}
+			confirmed: map[string]time.Time{}, peerPort: map[string]string{}, confBy: map[string]string{}}
 		fanoutUsers[key] = u
 	}
 	if clientIP != "" {
@@ -995,6 +1052,23 @@ func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 	for ip, t := range u.tcpPeers {
 		if _, ok := u.udpPeers[ip]; ok {
 			u.confirmed[ip] = t
+			if u.confBy[ip] == "" {
+				u.confBy[ip] = "tcp+udp"
+			}
+		}
+	}
+	for ip := range u.confBy {
+		if _, ok := u.confirmed[ip]; !ok {
+			delete(u.confBy, ip)
+		}
+	}
+	for ip := range u.peerPort {
+		_, c := u.confirmed[ip]
+		_, p := u.peers[ip]
+		_, t := u.tcpPeers[ip]
+		_, d := u.udpPeers[ip]
+		if !c && !p && !t && !d {
+			delete(u.peerPort, ip)
 		}
 	}
 	v := fanoutVerdict{Key: key, ClientIP: u.clientIP, Hosts: len(u.peers), Ports: len(u.ports), Confirmed: len(u.confirmed)}
@@ -1015,9 +1089,9 @@ func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 
 	switch {
 	case fanoutConfirmNeed > 0 && v.Confirmed >= fanoutConfirmNeed:
-		v.Ban, v.Reason = true, fmt.Sprintf("torrent_peers:%d", v.Confirmed)
+		v.Ban, v.Reason = true, fmt.Sprintf("torrent_peers:%d", v.Confirmed)+confirmedPeersNote(u)
 	case spread && v.Confirmed > 0:
-		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp+confirmed:%d", v.Hosts, v.Ports, v.Confirmed)
+		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp+confirmed:%d", v.Hosts, v.Ports, v.Confirmed)+confirmedPeersNote(u)
 	case spread && len(u.hits) >= 2:
 		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp x%d/%v", v.Hosts, v.Ports, len(u.hits), fanoutRepeatWindow)
 	}
@@ -1062,6 +1136,7 @@ func fanoutObserve(clientIP, email, dest, tag string, now time.Time) fanoutVerdi
 	u := fanoutUserFor(key, clientIP)
 	u.peers[ip] = now
 	u.ports[port] = now
+	u.peerPort[ip] = port
 	if proto == "udp" {
 		u.udpPeers[ip] = now
 	} else {
@@ -1069,6 +1144,7 @@ func fanoutObserve(clientIP, email, dest, tag string, now time.Time) fanoutVerdi
 	}
 	if isBlackholeTag(tag) {
 		u.confirmed[ip] = now // xray сам распознал bittorrent к этому пиру
+		u.confBy[ip] = "block"
 	}
 	return fanoutEvaluate(key, u, now)
 }
@@ -1085,6 +1161,9 @@ func fanoutConfirmPeers(caught map[string]bool, now time.Time) []fanoutVerdict {
 			if caught[ip] {
 				if _, ok := u.confirmed[ip]; !ok {
 					u.confirmed[ip] = t
+					if u.confBy[ip] == "" {
+						u.confBy[ip] = "dpi"
+					}
 					changed = true
 				}
 			}
