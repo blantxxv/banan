@@ -127,7 +127,9 @@ fi
 # ── Определяем реальный путь к access.log xray ──────────────────────────────
 # Вендорский дефолт /var/log/remnanode/access.log — это путь ВНУТРИ контейнера;
 # на хосте лог лежит в <папке ноды>/logs/access.log (compose монтирует ./logs).
-# С неверным путём блокер слеп. Ищем реально существующий файл.
+# С неверным путём блокер слеп. Ищем реально существующий файл, а на свежей
+# ноде (xray ещё не стартовал — ноду не завели в панели) — смонтированную папку
+# логов: файла там пока нет, блокер дождётся его появления.
 info "Поиск access.log xray на хосте..."
 LOGPATH=""
 LOGARGS=""
@@ -137,7 +139,7 @@ LOGARGS=""
 if command -v docker >/dev/null 2>&1; then
     for c in $(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($0) ~ /remnanode|remnawave\/node/ {print $1}'); do
         src="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/log/remnanode"}}{{.Source}}{{end}}{{end}}' "$c" 2>/dev/null)"
-        [ -n "$src" ] && [ -f "$src/access.log" ] || continue
+        [ -n "$src" ] && [ -d "$src" ] || continue
         case " $LOGARGS " in *" --log $src/access.log "*) continue ;; esac
         LOGARGS="$LOGARGS --log $src/access.log"; LOGPATH="${LOGPATH:-$src/access.log}"
         ok "access.log ($c): $src/access.log"
@@ -154,6 +156,15 @@ done
 if [ -z "${LOGPATH}" ]; then
     FOUND="$(find /opt /root /home /var/log -maxdepth 4 -type f -name access.log -path '*remnanode*' 2>/dev/null | head -1)"
     [ -n "${FOUND}" ] && LOGPATH="${FOUND}"
+fi
+if [ -z "${LOGPATH}" ]; then
+    for d in /opt/remnanode/logs /root/remnanode/logs /home/*/remnanode/logs; do
+        if [ -d "${d}" ]; then
+            LOGPATH="${d}/access.log"
+            warn "access.log ещё не создан — беру папку логов ноды ${d} (файл появится после старта xray)."
+            break
+        fi
+    done
 fi
 if [ -z "${LOGPATH}" ]; then
     LOGPATH="/var/log/remnanode/access.log"
