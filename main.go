@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -868,6 +869,79 @@ var (
 
 const fanoutSharedEmails = 3
 
+// Опрос серверов (sweep): игра при запуске меряет задержку до своих серверов
+// по всему миру, браузер серверов опрашивает список — десятки UDP-пакетов на
+// разные голые IP за миллисекунды, по одному на сервер (живой случай: 20
+// серверов облаков за 0.2 мс при запуске мобильной игры). Это не P2P: такие
+// пиры в разлёт не идут, а тег TORRENT на одном из них — ошибка uTP-сниффера
+// xray на игровом пакете. У торрента разлёт копится за минуты и вне всплесков.
+// Время берётся из строки access.log (микросекунды), а не из момента чтения.
+var (
+	sweepGap = 5 * time.Millisecond
+	sweepMin = 8
+)
+
+// Тег TORRENT на UDP к голому IP на порт вне BT-диапазона — слабый признак:
+// uTP-сниффер xray срабатывает на случайные игровые пакеты (живые данные флота
+// за 3 сут: у 23 из 26 юзеров с такими тегами — ровно одна строка). Бан, если
+// за fanoutWindow таких пиров udpTagNeed; TCP-теги и порты 6881–6999 — как раньше.
+var (
+	udpTagNeed         = 2
+	btPortLo, btPortHi = 6881, 6999
+)
+
+type udpProbe struct {
+	at       time.Time
+	ip, port string
+}
+
+// Популярные назначения: IP, к которому за popularWindow ходили ≥popularUsers
+// разных юзеров ноды, — сервер (игры, стриминг, списки прокси), а не пир
+// торрента: у каждого юзера рой свой. В разлёт такие IP не идут. Живые данные
+// флота за сутки: у ~45 из 64 юзеров с «разлётом ×2» пиры были одними и теми
+// же серверами (облака мобильных игр, ретрансляторы стриминга, общий список прокси).
+var (
+	popularUsers  = 3
+	popularWindow = 6 * time.Hour
+	popularMax    = 500000 // предел записей, чтобы не съесть память на большой ноде
+	popularDst    = map[string]*popularEntry{}
+)
+
+type popularEntry struct {
+	users []string
+	last  time.Time
+}
+
+// notePopular — под fanoutMu. Учитывает обращение юзера key к IP и говорит,
+// популярен ли IP (≥popularUsers разных юзеров за окно).
+func notePopular(ip, key string, now time.Time) bool {
+	if popularUsers <= 0 {
+		return false
+	}
+	e := popularDst[ip]
+	if e != nil && now.Sub(e.last) > popularWindow {
+		e = nil
+	}
+	if e == nil {
+		if len(popularDst) >= popularMax {
+			return false
+		}
+		e = &popularEntry{}
+		popularDst[ip] = e
+	}
+	e.last = now
+	if len(e.users) >= popularUsers {
+		return true
+	}
+	for _, u := range e.users {
+		if u == key {
+			return false
+		}
+	}
+	e.users = append(e.users, key)
+	return len(e.users) >= popularUsers
+}
+
 // Порты, которые дают легальный разлёт по голым IP.
 var fanoutIgnorePorts = [][2]int{
 	{3478, 3497},   // STUN/TURN: звонки, Discord, WebRTC
@@ -877,7 +951,8 @@ var fanoutIgnorePorts = [][2]int{
 	{5222, 5223},   // XMPP/WhatsApp, Apple push
 	{5228, 5230},   // Google push
 	{8801, 8810},   // Zoom
-	{27015, 27050}, // Steam
+	{27000, 27200}, // Steam: игровые серверы и опрос списка серверов
+	{28015, 28017}, // Rust
 }
 
 type fanoutUser struct {
@@ -888,6 +963,13 @@ type fanoutUser struct {
 	udpPeers  map[string]time.Time
 	confirmed map[string]time.Time // подтверждённые торрент-пиры
 	hits      []time.Time          // срабатывания разлёта
+	peerPort  map[string]string    // IP пира → последний порт (для причины бана)
+	confBy    map[string]string    // IP пира → чем подтверждён: block (xray-правило BLOCK), dpi, tcp+udp
+	udpBurst  []udpProbe           // UDP-пиры за последнюю секунду по времени строки (поиск опроса серверов)
+	swept     map[string]time.Time // IP из опроса серверов — в разлёт не идут
+	udpTags   map[string]time.Time // UDP-пиры со слабым тегом TORRENT
+	udpTagDst map[string]string    // IP → назначение со слабым тегом (для причины бана)
+	sweptLog  time.Time            // когда последний раз писали в журнал про опрос
 }
 
 // fanoutVerdict — решение по юзеру. Ban=true: банить clientIP (если не Shared).
@@ -954,6 +1036,60 @@ func fanoutPeer(dest string) (proto, ip, port string) {
 	return proto, host, port
 }
 
+// confirmedPeersNote — до 4 подтверждённых пиров «ip:порт/чем» для причины бана:
+// по ней админ видит, куда ходил клиент (звонок/игра против торрента). Сначала
+// сначала block и dpi, потом пара TCP+UDP; внутри — свежие.
+func confirmedPeersNote(u *fanoutUser) string {
+	type pr struct {
+		ip  string
+		t   time.Time
+		rnk int
+	}
+	var ps []pr
+	for ip, t := range u.confirmed {
+		r := 2
+		switch u.confBy[ip] {
+		case "block":
+			r = 0
+		case "dpi":
+			r = 1
+		}
+		ps = append(ps, pr{ip, t, r})
+	}
+	sort.Slice(ps, func(i, j int) bool {
+		if ps[i].rnk != ps[j].rnk {
+			return ps[i].rnk < ps[j].rnk
+		}
+		if !ps[i].t.Equal(ps[j].t) {
+			return ps[i].t.After(ps[j].t)
+		}
+		return ps[i].ip < ps[j].ip
+	})
+	if len(ps) == 0 {
+		return ""
+	}
+	var parts []string
+	for i, p := range ps {
+		if i == 4 {
+			break
+		}
+		host := p.ip
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		by := u.confBy[p.ip]
+		if by == "" {
+			by = "?"
+		}
+		port := u.peerPort[p.ip]
+		if port == "" {
+			port = "?"
+		}
+		parts = append(parts, host+":"+port+"/"+by)
+	}
+	return " peers:" + strings.Join(parts, ",")
+}
+
 func pruneSeen(m map[string]time.Time, cutoff time.Time) {
 	for k, t := range m {
 		if t.Before(cutoff) {
@@ -976,7 +1112,8 @@ func fanoutUserFor(key, clientIP string) *fanoutUser {
 	if u == nil {
 		u = &fanoutUser{peers: map[string]time.Time{}, ports: map[string]time.Time{},
 			tcpPeers: map[string]time.Time{}, udpPeers: map[string]time.Time{},
-			confirmed: map[string]time.Time{}}
+			confirmed: map[string]time.Time{}, peerPort: map[string]string{}, confBy: map[string]string{},
+			swept: map[string]time.Time{}, udpTags: map[string]time.Time{}, udpTagDst: map[string]string{}}
 		fanoutUsers[key] = u
 	}
 	if clientIP != "" {
@@ -988,13 +1125,35 @@ func fanoutUserFor(key, clientIP string) *fanoutUser {
 // fanoutEvaluate — под fanoutMu. Сбрасывает счётчики юзера после бана.
 func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 	cutoff := now.Add(-fanoutWindow)
-	for _, m := range []map[string]time.Time{u.peers, u.ports, u.tcpPeers, u.udpPeers, u.confirmed} {
+	for _, m := range []map[string]time.Time{u.peers, u.ports, u.tcpPeers, u.udpPeers, u.confirmed, u.swept, u.udpTags} {
 		pruneSeen(m, cutoff)
+	}
+	for ip := range u.udpTagDst {
+		if _, ok := u.udpTags[ip]; !ok {
+			delete(u.udpTagDst, ip)
+		}
 	}
 	// Karagiannis: один и тот же пир и по TCP, и по UDP — почти всегда P2P.
 	for ip, t := range u.tcpPeers {
 		if _, ok := u.udpPeers[ip]; ok {
 			u.confirmed[ip] = t
+			if u.confBy[ip] == "" {
+				u.confBy[ip] = "tcp+udp"
+			}
+		}
+	}
+	for ip := range u.confBy {
+		if _, ok := u.confirmed[ip]; !ok {
+			delete(u.confBy, ip)
+		}
+	}
+	for ip := range u.peerPort {
+		_, c := u.confirmed[ip]
+		_, p := u.peers[ip]
+		_, t := u.tcpPeers[ip]
+		_, d := u.udpPeers[ip]
+		if !c && !p && !t && !d {
+			delete(u.peerPort, ip)
 		}
 	}
 	v := fanoutVerdict{Key: key, ClientIP: u.clientIP, Hosts: len(u.peers), Ports: len(u.ports), Confirmed: len(u.confirmed)}
@@ -1015,9 +1174,9 @@ func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 
 	switch {
 	case fanoutConfirmNeed > 0 && v.Confirmed >= fanoutConfirmNeed:
-		v.Ban, v.Reason = true, fmt.Sprintf("torrent_peers:%d", v.Confirmed)
+		v.Ban, v.Reason = true, fmt.Sprintf("torrent_peers:%d", v.Confirmed)+confirmedPeersNote(u)
 	case spread && v.Confirmed > 0:
-		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp+confirmed:%d", v.Hosts, v.Ports, v.Confirmed)
+		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp+confirmed:%d", v.Hosts, v.Ports, v.Confirmed)+confirmedPeersNote(u)
 	case spread && len(u.hits) >= 2:
 		v.Ban, v.Reason = true, fmt.Sprintf("peer_fanout:%dh/%dp x%d/%v", v.Hosts, v.Ports, len(u.hits), fanoutRepeatWindow)
 	}
@@ -1036,8 +1195,129 @@ func fanoutEvaluate(key string, u *fanoutUser, now time.Time) fanoutVerdict {
 	return v
 }
 
-// fanoutObserve учитывает строку access.log.
+// logLineTime: время из начала строки access.log xray ("2026/10/29 19:27:16.867628").
+// Нет даты — нулевое время: опрос серверов для такой строки не ищем.
+func logLineTime(line string) time.Time {
+	f := strings.Fields(line)
+	if len(f) < 2 || len(f[0]) != 10 || f[0][4] != '/' {
+		return time.Time{}
+	}
+	t, err := time.Parse("2006/01/02 15:04:05.999999", f[0]+" "+f[1])
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// sweepObserve — под fanoutMu. Учитывает UDP-пир по времени строки и говорит,
+// входит ли он в опрос серверов: ≥sweepMin разных IP в пределах ±sweepGap.
+// Найденный опрос вычёркивается из разлёта и слабых тегов. cluster — сколько
+// разных IP рядом (опрос мог ещё не дочитаться).
+func sweepObserve(u *fanoutUser, ip, port string, at, now time.Time) (inSweep bool, cluster int) {
+	if at.IsZero() {
+		return false, 1
+	}
+	if _, ok := u.swept[ip]; ok {
+		return true, 0
+	}
+	keep := u.udpBurst[:0]
+	for _, p := range u.udpBurst {
+		if d := at.Sub(p.at); d <= time.Second && d >= -time.Second {
+			keep = append(keep, p)
+		}
+	}
+	u.udpBurst = append(keep, udpProbe{at, ip, port})
+	near := map[string]string{}
+	for _, p := range u.udpBurst {
+		if d := at.Sub(p.at); d <= sweepGap && d >= -sweepGap {
+			near[p.ip] = p.port
+		}
+	}
+	if len(near) < sweepMin {
+		return false, len(near)
+	}
+	for nip, nport := range near {
+		u.swept[nip] = now
+		delete(u.peers, nip)
+		delete(u.udpPeers, nip)
+		delete(u.udpTags, nip)
+		delete(u.udpTagDst, nip)
+		delete(u.ports, nport)
+	}
+	if now.Sub(u.sweptLog) > fanoutWindow {
+		u.sweptLog = now
+		log.Printf("UDP_SWEEP %s: %d серверов за %v — опрос серверов (игра), в разлёт не идёт", u.clientIP, len(near), 2*sweepGap)
+	}
+	return true, len(near)
+}
+
+// fanoutObserve учитывает строку access.log (без времени строки).
 func fanoutObserve(clientIP, email, dest, tag string, now time.Time) fanoutVerdict {
+	return fanoutObserveAt(clientIP, email, dest, tag, time.Time{}, now)
+}
+
+// weakUDPTag: тег TORRENT на UDP к голому IP вне BT-портов — слабый признак.
+func weakUDPTag(dest string) (ip, port string, ok bool) {
+	if !strings.HasPrefix(dest, "udp:") {
+		return "", "", false
+	}
+	host, port, err := net.SplitHostPort(strings.TrimPrefix(dest, "udp:"))
+	if err != nil || net.ParseIP(host) == nil {
+		return "", "", false
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || (p >= btPortLo && p <= btPortHi) {
+		return "", "", false
+	}
+	return host, port, true
+}
+
+// fanoutWeakTag: строка с тегом TORRENT на UDP вне BT-портов. Бан — только если
+// за fanoutWindow таких разных пиров udpTagNeed и они не из опроса серверов.
+func fanoutWeakTag(clientIP, email, dest string, at, now time.Time) fanoutVerdict {
+	ip, port, ok := weakUDPTag(dest)
+	if !ok {
+		return fanoutVerdict{}
+	}
+	fanoutMu.Lock()
+	defer fanoutMu.Unlock()
+	key := email
+	if key == "" {
+		key = "ip:" + clientIP
+	}
+	if notePopular(ip, key, now) {
+		log.Printf("UDP_TAG_POPULAR %s user=%s dst=%s — к серверу ходят ≥%d юзеров, не баню", clientIP, email, dest, popularUsers)
+		return fanoutVerdict{}
+	}
+	u := fanoutUserFor(key, clientIP)
+	if in, _ := sweepObserve(u, ip, port, at, now); in {
+		log.Printf("UDP_TAG_SWEEP %s user=%s dst=%s — тег в опросе серверов, не баню", clientIP, email, dest)
+		return fanoutVerdict{}
+	}
+	pruneSeen(u.udpTags, now.Add(-fanoutWindow))
+	u.udpTags[ip] = now
+	u.udpTagDst[ip] = dest
+	v := fanoutVerdict{Key: key, ClientIP: u.clientIP}
+	if udpTagNeed <= 0 || len(u.udpTags) < udpTagNeed {
+		log.Printf("UDP_TAG_WEAK %s user=%s dst=%s — %d/%d, жду ещё", clientIP, email, dest, len(u.udpTags), udpTagNeed)
+		return v
+	}
+	var dsts []string
+	for k := range u.udpTagDst {
+		dsts = append(dsts, u.udpTagDst[k])
+	}
+	sort.Strings(dsts)
+	v.Ban = true
+	v.Reason = fmt.Sprintf("xray_tag:%s user:%s dst:%s udp_tags:%d", torrentTag, email, dest, len(u.udpTags))
+	if len(dsts) > 1 {
+		v.Reason += " peers:" + strings.Join(dsts, ",")
+	}
+	u.udpTags, u.udpTagDst = map[string]time.Time{}, map[string]string{}
+	return v
+}
+
+// fanoutObserveAt учитывает строку access.log; at — время из самой строки.
+func fanoutObserveAt(clientIP, email, dest, tag string, at, now time.Time) fanoutVerdict {
 	fanoutMu.Lock()
 	defer fanoutMu.Unlock()
 
@@ -1059,9 +1339,20 @@ func fanoutObserve(clientIP, email, dest, tag string, now time.Time) fanoutVerdi
 	if key == "" {
 		key = "ip:" + clientIP
 	}
+	if notePopular(ip, key, now) && !isBlackholeTag(tag) {
+		return fanoutVerdict{}
+	}
 	u := fanoutUserFor(key, clientIP)
+	cluster := 1
+	if proto == "udp" && !isBlackholeTag(tag) {
+		var in bool
+		if in, cluster = sweepObserve(u, ip, port, at, now); in {
+			return fanoutVerdict{}
+		}
+	}
 	u.peers[ip] = now
 	u.ports[port] = now
+	u.peerPort[ip] = port
 	if proto == "udp" {
 		u.udpPeers[ip] = now
 	} else {
@@ -1069,6 +1360,12 @@ func fanoutObserve(clientIP, email, dest, tag string, now time.Time) fanoutVerdi
 	}
 	if isBlackholeTag(tag) {
 		u.confirmed[ip] = now // xray сам распознал bittorrent к этому пиру
+		u.confBy[ip] = "block"
+	}
+	if cluster > 1 {
+		// идёт плотная пачка UDP — возможно, опрос серверов ещё дочитывается;
+		// оценим на следующей строке, когда станет ясно
+		return fanoutVerdict{}
 	}
 	return fanoutEvaluate(key, u, now)
 }
@@ -1085,6 +1382,9 @@ func fanoutConfirmPeers(caught map[string]bool, now time.Time) []fanoutVerdict {
 			if caught[ip] {
 				if _, ok := u.confirmed[ip]; !ok {
 					u.confirmed[ip] = t
+					if u.confBy[ip] == "" {
+						u.confBy[ip] = "dpi"
+					}
 					changed = true
 				}
 			}
@@ -1121,6 +1421,11 @@ func fanoutGC(now time.Time) {
 	for k, m := range fanoutSrc {
 		if pruneSeen(m, now.Add(-fanoutWindow)); len(m) == 0 {
 			delete(fanoutSrc, k)
+		}
+	}
+	for ip, e := range popularDst {
+		if now.Sub(e.last) > popularWindow {
+			delete(popularDst, ip)
 		}
 	}
 }
@@ -1281,7 +1586,7 @@ func monitorLog(path string) {
 			dest := extractDestFromLine(line)
 			if dest != "" {
 				// сначала учесть строку: punish() проверяет, общий ли источник
-				fanoutApply(fanoutObserve(extractClientIPFromLine(line), scopeKey(scope, extractEmailFromLine(line)), dest, lineOutboundTag(line), time.Now()))
+				fanoutApply(fanoutObserveAt(extractClientIPFromLine(line), scopeKey(scope, extractEmailFromLine(line)), dest, lineOutboundTag(line), logLineTime(line), time.Now()))
 			}
 			if dest != "" && isDomainTorrent(dest) && torrentBanworthy(dest, false) {
 				cip := extractClientIPFromLine(line)
@@ -1296,6 +1601,15 @@ func monitorLog(path string) {
 
 		if clientIP != "" && email != "" {
 			fanoutObserve(clientIP, email, "", torrentTag, time.Now()) // только учёт источника
+		}
+		if _, _, weak := weakUDPTag(destAddr); weak {
+			// UDP вне BT-портов: uTP-сниффер xray ошибается на игровых пакетах.
+			// Пира в ipset не заносим — это мог быть игровой сервер для всех.
+			v := fanoutWeakTag(clientIP, email, destAddr, logLineTime(line), time.Now())
+			if v.Ban && ((clientIP != "" && !isProtectedIP(clientIP)) || banableUser(email)) {
+				punish(clientIP, email, v.Reason, true)
+			}
+			continue
 		}
 		if destAddr != "" && !torrentBanworthy(destAddr, true) {
 			// сайт или служебный домен клиента: xray его и так режет, но это не P2P

@@ -427,11 +427,164 @@ func resetFanout() {
 	fanoutMu.Lock()
 	fanoutUsers = map[string]*fanoutUser{}
 	fanoutSrc = map[string]map[string]time.Time{}
+	popularDst = map[string]*popularEntry{}
 	fanoutMu.Unlock()
 }
 
+// Сервер, к которому ходят ≥3 юзеров ноды (облако мобильной игры, ретранслятор
+// стриминга, общий список прокси), в разлёт не идёт; пиры роя — у каждого свои.
+func TestPopularServersNotPeers(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	now := time.Now()
+	servers := func(round int) []string {
+		var s []string
+		for i := 0; i < 40; i++ {
+			s = append(s, fmt.Sprintf("udp:11.%d.%d.%d:%d", 100+i%20, round%3, i, 10000+i*911+round))
+		}
+		return s
+	}
+	// два юзера раньше уже ходили к тем же серверам
+	for _, who := range []string{"2001", "2002"} {
+		for _, d := range servers(0) {
+			feedLine(fmt.Sprintf("from 11.8.1.%s:1 accepted %s [x >> DIRECT] email: %s", who[3:], d, who), now)
+		}
+	}
+	resetUsersOnly := func() { fanoutMu.Lock(); fanoutUsers = map[string]*fanoutUser{}; fanoutMu.Unlock() }
+	resetUsersOnly()
+	for round := 0; round < 3; round++ {
+		for i, d := range servers(0) {
+			if v := feedLine(fmt.Sprintf("from 11.8.1.9:%d accepted %s [x >> DIRECT] email: 2003", i, d), now.Add(time.Duration(round)*4*time.Minute)); v.Ban {
+				t.Fatalf("общие серверы засчитаны как рой (раунд %d): %+v", round, v)
+			}
+		}
+	}
+	// а свои пиры у того же юзера — по-прежнему разлёт
+	var v fanoutVerdict
+	for i := 0; i < 2*fanoutThresh && !v.Ban; i++ {
+		v = feedLine(fmt.Sprintf("from 11.8.1.9:%d accepted udp:11.%d.%d.77:%d [x >> DIRECT] email: 2003", i, 150+i%60, i/60, 20000+i*7), now.Add(13*time.Minute+time.Duration(i)*time.Second))
+	}
+	if !v.Ban {
+		t.Fatalf("свой рой после общих серверов должен банить: %+v", v)
+	}
+}
+
 func feedLine(line string, now time.Time) fanoutVerdict {
-	return fanoutObserve(extractClientIPFromLine(line), extractEmailFromLine(line), extractDestFromLine(line), lineOutboundTag(line), now)
+	return fanoutObserveAt(extractClientIPFromLine(line), extractEmailFromLine(line), extractDestFromLine(line), lineOutboundTag(line), logLineTime(line), now)
+}
+
+func TestLogLineTime(t *testing.T) {
+	got := logLineTime("2026/10/29 19:27:16.867628 from tcp:11.8.5.8:49359 accepted udp:11.40.25.113:37305 [GRPC_EE -> DIRECT] email: 1001")
+	want := time.Date(2026, 10, 29, 19, 27, 16, 867628000, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, l := range []string{"20:24:10.643204 from 1.2.3.4:5 accepted tcp:x:1", "from 1.2.3.4:5 accepted tcp:x:1", ""} {
+		if !logLineTime(l).IsZero() {
+			t.Fatalf("%q: ждали нулевое время", l)
+		}
+	}
+}
+
+// Живой случай: запуск мобильной игры — за 0.2 мс UDP на 20 игровых серверов
+// облаков по всему миру, на одном из них uTP-сниффер xray поставил TORRENT.
+// Два запуска за 15 мин раньше давали «разлёт ×2» и предупреждение.
+func TestGameSweepNotTorrent(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	now := time.Now()
+	launch := func(min int, tagAt int) {
+		base := time.Date(2026, 10, 29, 19, min, 16, 867500000, time.UTC)
+		for i := 0; i < 20; i++ {
+			at := base.Add(time.Duration(i*8) * time.Microsecond)
+			dst := fmt.Sprintf("udp:11.%d.%d.%d:%d", 40+i, min, 10+i, 12000+i*937)
+			ts := at.Format("2006/01/02 15:04:05.000000")
+			if i == tagAt {
+				l := fmt.Sprintf("%s from tcp:11.8.5.8:49359 accepted %s [GRPC_EE -> TORRENT] email: 1001", ts, dst)
+				if v := fanoutWeakTag(extractClientIPFromLine(l), "1001", dst, logLineTime(l), now); v.Ban {
+					t.Fatalf("тег в опросе серверов забанил: %+v", v)
+				}
+				continue
+			}
+			l := fmt.Sprintf("%s from tcp:11.8.5.8:49359 accepted %s [GRPC_EE -> DIRECT] email: 1001", ts, dst)
+			if v := feedLine(l, now); v.Ban {
+				t.Fatalf("опрос серверов забанен на %d-м пакете: %+v", i, v)
+			}
+		}
+		// после опроса — обычная игра: TCP к серверу и домены
+		for i, d := range []string{"tcp:11.60.95.61:9339", "tcp:id.example-game.com:443"} {
+			l := fmt.Sprintf("2026/10/29 19:%02d:%02d.100000 from 11.8.5.8:%d accepted %s [GRPC_EE -> DIRECT] email: 1001", min, 20+i, 49360+i, d)
+			if v := feedLine(l, now); v.Ban {
+				t.Fatalf("игра забанена: %+v", v)
+			}
+		}
+	}
+	launch(27, 9)
+	now = now.Add(3 * time.Minute)
+	launch(30, 0) // тег первым в пачке — опрос ещё не виден
+	now = now.Add(3 * time.Minute)
+	launch(33, 19)
+}
+
+// Торрент с DHT: пиры по одному, вне плотных пачек — бан по второму разлёту как раньше,
+// и волны DHT по 3–5 запросов опросом серверов не считаются.
+func TestDHTSpreadStillBanned(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	now := time.Now()
+	base := time.Date(2026, 10, 29, 18, 0, 0, 0, time.UTC)
+	n := 0
+	var v fanoutVerdict
+	for wave := 0; wave < 40 && !v.Ban; wave++ {
+		for j := 0; j < 4 && !v.Ban; j++ {
+			at := base.Add(time.Duration(wave)*3*time.Second + time.Duration(j)*time.Millisecond)
+			l := fmt.Sprintf("%s from 11.8.7.7:5000 accepted udp:11.%d.%d.%d:%d [x >> DIRECT] email: 1002",
+				at.Format("2006/01/02 15:04:05.000000"), 70+n%50, n/50, n%200, 20000+n*13)
+			n++
+			v = feedLine(l, now.Add(time.Duration(wave)*3*time.Second))
+		}
+	}
+	if !v.Ban || !strings.HasPrefix(v.Reason, "peer_fanout:") {
+		t.Fatalf("DHT-разлёт должен банить: %+v после %d пиров", v, n)
+	}
+}
+
+// Слабый тег: один UDP-тег вне BT-портов не банит, второй пир за окно — бан
+// с причиной xray_tag (сервер считает её надёжной); TCP и 6881–6999 — не слабые.
+func TestWeakUDPTag(t *testing.T) {
+	resetBypass()
+	resetFanout()
+	now := time.Now()
+	for _, c := range []struct {
+		dst  string
+		weak bool
+	}{
+		{"udp:11.40.25.113:37305", true},
+		{"udp:11.40.25.113:6881", false},
+		{"udp:11.40.25.113:6999", false},
+		{"tcp:11.40.25.113:37305", false},
+		{"udp:tracker.example.org:6969", false},
+	} {
+		if _, _, w := weakUDPTag(c.dst); w != c.weak {
+			t.Fatalf("%s: weak=%v, ждали %v", c.dst, w, c.weak)
+		}
+	}
+	if v := fanoutWeakTag("11.8.9.9", "1003", "udp:11.41.1.1:40001", time.Time{}, now); v.Ban {
+		t.Fatalf("один слабый тег забанил: %+v", v)
+	}
+	if v := fanoutWeakTag("11.8.9.9", "1003", "udp:11.41.1.1:40001", time.Time{}, now.Add(time.Second)); v.Ban {
+		t.Fatalf("тот же пир повторно — это не второй пир: %+v", v)
+	}
+	v := fanoutWeakTag("11.8.9.9", "1003", "udp:11.42.2.2:40002", time.Time{}, now.Add(2*time.Second))
+	if !v.Ban || !strings.HasPrefix(v.Reason, "xray_tag:TORRENT user:1003 dst:udp:11.42.2.2:40002 udp_tags:2") {
+		t.Fatalf("второй пир со слабым тегом — бан: %+v", v)
+	}
+	// окно вышло — счёт заново
+	resetFanout()
+	fanoutWeakTag("11.8.9.9", "1004", "udp:11.41.1.1:40001", time.Time{}, now)
+	if v := fanoutWeakTag("11.8.9.9", "1004", "udp:11.42.2.2:40002", time.Time{}, now.Add(fanoutWindow+time.Second)); v.Ban {
+		t.Fatalf("теги дальше окна не должны складываться: %+v", v)
+	}
 }
 
 const pcLine = "2026/10/20 20:09:05.320208 from 11.8.148.112:%d accepted tcp:%s [VLESS_TCP_TLS_EE_443_clone >> DIRECT] email: 4"
@@ -479,6 +632,9 @@ func TestFanoutXrayBlackholeConfirms(t *testing.T) {
 	if !v.Ban || v.Confirmed != 3 {
 		t.Fatalf("3 пира в BLOCK — бан: %+v", v)
 	}
+	if !strings.Contains(v.Reason, " peers:") || !strings.Contains(v.Reason, "11.17.111.162:9999/block") {
+		t.Fatalf("в причине нет пиров: %q", v.Reason)
+	}
 	// BLOCK рекламы (домен), SMTP (25) и приватных — не подтверждение.
 	resetFanout()
 	for i, d := range []string{"tcp:ads.example.com:443", "tcp:8.8.8.8:25", "tcp:10.1.2.3:40000", "tcp:1.1.1.1:443"} {
@@ -505,6 +661,9 @@ func TestFanoutDPIConfirms(t *testing.T) {
 	if len(vs) != 1 || !vs[0].Ban || vs[0].ClientIP != "11.8.148.112" {
 		t.Fatalf("3 пира из auto_peers должны дать бан: %+v", vs)
 	}
+	if !strings.Contains(vs[0].Reason, "83.9.88.10:13070/dpi") {
+		t.Fatalf("в причине нет пиров DPI: %q", vs[0].Reason)
+	}
 }
 
 // Karagiannis: один пир и по TCP, и по UDP.
@@ -520,6 +679,30 @@ func TestFanoutTCPUDPPair(t *testing.T) {
 	}
 	if !v.Ban {
 		t.Fatalf("3 пира TCP+UDP — бан: %+v", v)
+	}
+	if !strings.Contains(v.Reason, "46.187.88.32:10786/tcp+udp") || strings.Count(v.Reason, "/tcp+udp") != 3 {
+		t.Fatalf("в причине нет пар TCP+UDP: %q", v.Reason)
+	}
+}
+
+// В причине не больше 4 пиров, block и dpi — первыми.
+func TestConfirmedPeersNoteOrder(t *testing.T) {
+	now := time.Now()
+	u := &fanoutUser{confirmed: map[string]time.Time{}, peerPort: map[string]string{}, confBy: map[string]string{}}
+	for i := 0; i < 6; i++ {
+		ip := fmt.Sprintf("11.5.5.%d", i)
+		u.confirmed[ip] = now.Add(time.Duration(i) * time.Second)
+		u.peerPort[ip] = "5000"
+		u.confBy[ip] = "tcp+udp"
+	}
+	u.confBy["11.5.5.0"] = "block"
+	u.confirmed["2001:db8::1"] = now
+	u.peerPort["2001:db8::1"] = "6881"
+	u.confBy["2001:db8::1"] = "dpi"
+	got := confirmedPeersNote(u)
+	want := " peers:11.5.5.0:5000/block,[2001:db8::1]:6881/dpi,11.5.5.5:5000/tcp+udp,11.5.5.4:5000/tcp+udp"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
