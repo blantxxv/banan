@@ -1041,9 +1041,10 @@ func fanoutPeer(dest string) (proto, ip, port string) {
 
 // confirmedCount — сколько подтверждённых пиров засчитать. block и dpi — поштучно.
 // Пара TCP+UDP к одному IP — признак P2P, но так же ходят клиенты игр и стримов:
-// к нескольким серверам одной сети или к серверам на одном и том же порту.
-// Поэтому tcp+udp-пиры считаем по сетям (/16, IPv6 — /32), а если все они на
-// одном порту вне BT-диапазона — как одного пира.
+// к нескольким серверам одной сети или к серверам на одном-двух портах. У роя и
+// сети, и порты у каждого пира свои, поэтому tcp+udp-пиры считаем как меньшее из
+// числа сетей (/16, IPv6 — /32) и числа портов. Порт из 6881–6999 — торрентовый,
+// такой пир даёт свой счёт порта, даже если порт у всех один.
 func confirmedCount(u *fanoutUser) int {
 	n := 0
 	nets := map[string]bool{}
@@ -1054,17 +1055,14 @@ func confirmedCount(u *fanoutUser) int {
 			continue
 		}
 		nets[peerNet(ip)] = true
-		ports[u.peerPort[ip]] = true
-	}
-	if len(nets) == 0 {
-		return n
-	}
-	if len(ports) == 1 {
-		for p := range ports {
-			if pn, err := strconv.Atoi(p); err != nil || pn < btPortLo || pn > btPortHi {
-				return n + 1
-			}
+		port := u.peerPort[ip]
+		if pn, err := strconv.Atoi(port); err == nil && pn >= btPortLo && pn <= btPortHi {
+			port = ip
 		}
+		ports[port] = true
+	}
+	if len(ports) < len(nets) {
+		return n + len(ports)
 	}
 	return n + len(nets)
 }
