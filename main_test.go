@@ -947,6 +947,30 @@ func TestInboundUserAndRestoreConfig(t *testing.T) {
 	}
 }
 
+func TestTorrentWordsWholeOnly(t *testing.T) {
+	for _, d := range []string{
+		"tcp:announce.example.org:6969", "tcp:announce2.example.org:6969", "tcp:my-announce.example.org:80",
+		"tcp:magnet.example.org:8080", "tcp:magnetdl.com:8080", "tcp:nyaa.si:8080", "tcp:eztv.re:8080",
+		"tcp:torlock.com:8080", "tcp:retracker.local:80", "udp:retracker.example.org:2710",
+		"tcp:hyper-torrent.example.com:8001",
+	} {
+		if !isDomainTorrent(d) {
+			t.Errorf("%s должен считаться торрентом", d)
+		}
+	}
+	for _, d := range []string{
+		"tcp:announcement.example.cn:8529", "tcp:announcements.example.com:8443", "tcp:announcer.example.com:8443",
+		"udp:thismagnetneon.com:53", "udp:www.magnetoasis.com:53", "udp:germanmagnet.com:967",
+		"udp:dvdcompanyaa.net:53", "udp:www.activeweekendskinnyaaa.com:53", "tcp:www.333nrnp3t65kuesceztv4.com:37",
+		"udp:www.doctorlockerbitscs.com:53", "udp:creatorlockerdiscountspro.com:53",
+		"udp:furnituretrackeraroundlynx.net:797", "udp:www.firstinsuretracker.org:554",
+	} {
+		if isDomainTorrent(d) {
+			t.Errorf("%s не должен считаться торрентом", d)
+		}
+	}
+}
+
 func TestFilesFmNotTorrent(t *testing.T) {
 	if isDomainTorrent("tcp:ru.files.fm:443") {
 		t.Fatal("ru.files.fm — файлообменник, ложный бан 25.10")

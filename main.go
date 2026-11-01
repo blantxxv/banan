@@ -243,12 +243,12 @@ var torrentDestDomains = []string{
 }
 
 var torrentDestKeywords = []string{
-	"torrent", "bittorrent", "magnet", "rutracker", "rutor", "piratebay", "thepiratebay",
-	"opentrackr", "1337x", "nyaa", "rarbg", "demonoid", "yggtorrent",
-	"limetorrents", "torrentgalaxy", "eztv", "zooqle", "torlock",
+	"torrent", "bittorrent", "rutracker", "rutor", "piratebay", "thepiratebay",
+	"opentrackr", "1337x", "rarbg", "demonoid", "yggtorrent",
+	"limetorrents", "torrentgalaxy", "zooqle",
 	"skytorrents", "torrentz", "btdigg", "nnmclub", "tapochek", "kinozal",
 	"fast-torrent", "qbittorrent", "utorrent", "webtorrent",
-	"announce", "opentracker", "publictracker", "retracker",
+	"opentracker", "publictracker",
 	"btih", "infohash",
 	"openbittorrent.com", "opentrackr.org", "coppersurfer.tk", "leechers-paradise.org",
 	"internetwarriors.net", "torrent.eu.org", "moeking.me", "bt-hash.com",
@@ -261,6 +261,25 @@ var torrentDestKeywords = []string{
 	"dpiui.reedlan.com", "zum.bi", "dler.org", "nyaatracker.com",
 	"trakx.nibba.trade", "itzmx.com", "sakurato.xyz", "leech.ie",
 	"animereactor.ru", "kamigami.org", "shkinev.me",
+}
+
+// torrentDestWords совпадают только целым словом имени (с цифрами на конце):
+// подстрока ловила announcement.* (API приложений) и случайные домены вроде
+// thismagnetneon.com, dvdcompanyaa.net, doctorlockerbits.com, furnituretracker.net.
+var torrentDestWords = map[string]bool{
+	"announce": true, "magnet": true, "magnetdl": true, "nyaa": true, "eztv": true, "eztvx": true,
+	"torlock": true, "retracker": true,
+}
+
+// hasTorrentWord: есть ли в имени хоста слово из torrentDestWords. Слова
+// разделены точками и дефисами, цифры в конце не считаются (announce2).
+func hasTorrentWord(host string) bool {
+	for _, w := range strings.FieldsFunc(host, func(r rune) bool { return r == '.' || r == '-' || r == '_' }) {
+		if torrentDestWords[strings.TrimRight(w, "0123456789")] {
+			return true
+		}
+	}
+	return false
 }
 
 var bypassDomains = []string{
@@ -831,7 +850,7 @@ func isDomainTorrent(dest string) bool {
 			return true
 		}
 	}
-	return false
+	return hasTorrentWord(host)
 }
 
 // ── Детектор торрент-юзеров по access.log ────────────────────────────────────
