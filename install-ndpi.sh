@@ -143,7 +143,11 @@ if [ -n "$KMAKE" ] && grep -q 'femit-struct-debug-detailed' "$mk" 2>/dev/null; t
 fi
 
 log "собираю libnDPI (самый долгий шаг, несколько минут)…"
-( cd /opt/ndpi-build && ./autogen.sh && ./configure && make -j"$(nproc)" ) >>"$LOG" 2>&1 \
+# GCC 14+ (Ubuntu 26.04: GCC 15) считает неявное объявление функции ошибкой, а в
+# ndpi_define.h на этой ревизии memcpy без <string.h>. Флаги только для libnDPI —
+# модуль ядра собирается Kbuild'ом своими флагами. На старых gcc флаги безвредны.
+NDPI_CFLAGS="${CFLAGS:--O2 -g} -include string.h -Wno-error=implicit-function-declaration"
+( cd /opt/ndpi-build && ./autogen.sh && CFLAGS="$NDPI_CFLAGS" ./configure && make -j"$(nproc)" ) >>"$LOG" 2>&1 \
   || { err "сборка libnDPI не удалась (см. $LOG)"; exit 1; }
 log "собираю модуль xt_ndpi…"
 ( cd /opt/ndpi-build/ndpi-netfilter && make -j"$(nproc)" $KMAKE ) >>"$LOG" 2>&1 || true
