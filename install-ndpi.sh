@@ -141,6 +141,17 @@ if [ -n "$KMAKE" ] && grep -q 'femit-struct-debug-detailed' "$mk" 2>/dev/null; t
     && ok "вырезан gcc-only флаг -femit-struct-debug-detailed=any" \
     || warn "не смог поправить Makefile — сборка на clang может упасть"
 fi
+# Ядра < 5.18 (Ubuntu 22.04: 5.15) собирают модули с -std=gnu89, а в main.c есть
+# `for (int i…)` → «'for' loop initial declarations are only allowed in C99 or C11
+# mode»; и ndpi_utils.c зовёт get_random_bytes(), который там не приходит транзитом
+# из других заголовков. Kbuild берёт последний -std, так что дописанный gnu11
+# побеждает; на ядрах 5.18+ (gnu11 по умолчанию, random.h и так подтянут) оба флага
+# ничего не меняют. Попадает и в DKMS — исходник для него копируется отсюда же.
+if [ -f "$mk" ] && ! grep -q 'std=gnu11' "$mk"; then
+  sed -i '1i ccflags-y += -std=gnu11 -include linux/random.h' "$mk" \
+    && ok "Kbuild: ccflags-y += -std=gnu11 -include linux/random.h (старые ядра)" \
+    || warn "не смог поправить Kbuild — на ядрах <5.18 модуль может не собраться"
+fi
 
 log "собираю libnDPI (самый долгий шаг, несколько минут)…"
 # GCC 14+ (Ubuntu 26.04: GCC 15) считает неявное объявление функции ошибкой, а в
@@ -174,6 +185,11 @@ DK
   dkms build -m ndpi -v 1.0 >>"$LOG" 2>&1 || true
   dkms install -m ndpi -v 1.0 --force >>"$LOG" 2>&1 || true
   modinfo xt_ndpi >/dev/null 2>&1 || { mkdir -p "/lib/modules/$KREL/updates/dkms"; cp "$KO" "/lib/modules/$KREL/updates/dkms/"; depmod -a; }
+  # Если xt_ndpi запечён в initramfs (modules-load.d от прежней установки), при загрузке
+  # поднимется СТАРАЯ копия оттуда → «module version X != Y» и правило не встаёт.
+  if command -v lsinitramfs >/dev/null 2>&1 && lsinitramfs "/boot/initrd.img-$KREL" 2>/dev/null | grep -q 'xt_ndpi\.ko'; then
+    update-initramfs -u -k "$KREL" >>"$LOG" 2>&1 && ok "initramfs обновлён (в нём лежал xt_ndpi)" || warn "update-initramfs не прошёл"
+  fi
   XTDIR="$(pkg-config --variable=xtlibdir xtables 2>/dev/null || echo /usr/lib/$(uname -m)-linux-gnu/xtables)"
   cp "$SO" "$XTDIR/libxt_ndpi.so" 2>/dev/null || true
 fi
