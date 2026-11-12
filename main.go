@@ -465,20 +465,25 @@ func cleanupDPI() {
 					continue
 				}
 				for _, chain := range dpiHooks {
-					dir := "--dport"
 					if chain == "INPUT" {
-						dir = "--sport"
+						deleteAll(ipt, sportDropArgs("-D", chain, proto, port))
+						deleteAll(ipt, legacySportDropArgs("-D", chain, proto, port))
+						continue
 					}
-					exec.Command(ipt, "-D", chain, "-p", proto, dir, port, "-j", "DROP").Run()
+					deleteAll(ipt, dportDropArgs("-D", chain, proto, port))
+					deleteAll(ipt, legacyDportDropArgs("-D", chain, proto, port))
 				}
 			}
 			for _, port := range clientPorts {
 				if vpnPorts[port] {
 					continue
 				}
-				exec.Command(ipt, "-D", "FORWARD", "-p", proto, "--dport", port, "-j", "DROP").Run()
-				exec.Command(ipt, "-D", "FORWARD", "-p", proto, "--sport", port, "-j", "DROP").Run()
-				exec.Command(ipt, "-D", "INPUT", "-p", proto, "--sport", port, "-j", "DROP").Run()
+				deleteAll(ipt, dportDropArgs("-D", "FORWARD", proto, port))
+				deleteAll(ipt, legacyDportDropArgs("-D", "FORWARD", proto, port))
+				for _, chain := range []string{"FORWARD", "INPUT"} {
+					deleteAll(ipt, sportDropArgs("-D", chain, proto, port))
+					deleteAll(ipt, legacySportDropArgs("-D", chain, proto, port))
+				}
 			}
 		}
 	}
@@ -1841,6 +1846,53 @@ func sportSafe(port string) bool {
 	return n < 32768
 }
 
+// sportDropArgs — аргументы правила DROP по source-порту.
+//
+// Режем ТОЛЬКО ответы на соединения, которые открыл сам сервер (или клиент за
+// FORWARD): --ctstate ESTABLISHED --ctdir REPLY. Это ровно «ответ трекера/пира».
+// Без этого условия правило било по своим же:
+//   - на нодах ip_local_port_range часто 1024-65535 (а не 32768-60999), и xray,
+//     открывая loopback-соединение 127.0.0.1:x → 127.0.0.1:19461, получал
+//     исходный порт 6972/4662 — его SYN в INPUT дропался;
+//   - CGNAT мобильных/домашних операторов выдаёт абоненту любые порты, и клиент
+//     с исходным 6889/3659 не мог подключиться к :443/:8443 (SYN → DROP, ретраи).
+//
+// Входящие соединения клиентов имеют направление ORIGINAL и под правило не попадают.
+func sportDropArgs(op, chain, proto, port string) []string {
+	return []string{op, chain, "-p", proto, "--sport", port,
+		"-m", "conntrack", "--ctstate", "ESTABLISHED", "--ctdir", "REPLY",
+		"-j", "DROP"}
+}
+
+// dportDropArgs — DROP по порту назначения (OUTPUT/FORWARD), только для пакетов
+// в направлении ORIGINAL, т.е. соединений, которые открываем МЫ (к трекеру/пиру).
+// Без --ctdir ORIGINAL правило резало и наш SYN-ACK клиенту, пришедшему с
+// исходного порта 6969/3659/2710 (CGNAT) — клиент не мог подключиться.
+func dportDropArgs(op, chain, proto, port string) []string {
+	return []string{op, chain, "-p", proto, "--dport", port,
+		"-m", "conntrack", "--ctdir", "ORIGINAL", "-j", "DROP"}
+}
+
+func legacyDportDropArgs(op, chain, proto, port string) []string {
+	return []string{op, chain, "-p", proto, "--dport", port, "-j", "DROP"}
+}
+
+// legacySportDropArgs — форма правила до 2026-11-13 (без conntrack). Нужна только
+// чтобы cleanup снял её с нод, обновлённых поверх старой версии.
+func legacySportDropArgs(op, chain, proto, port string) []string {
+	return []string{op, chain, "-p", proto, "--sport", port, "-j", "DROP"}
+}
+
+// deleteAll повторяет -D, пока правило есть (после iptables-restore + старта
+// демона одно и то же правило могло оказаться в цепочке несколько раз).
+func deleteAll(ipt string, args []string) {
+	for i := 0; i < 32; i++ {
+		if exec.Command(ipt, args...).Run() != nil {
+			return
+		}
+	}
+}
+
 func applyPortBlock() int {
 	count := 0
 	for _, ipt := range []string{"iptables", "ip6tables"} {
@@ -1850,16 +1902,18 @@ func applyPortBlock() int {
 					continue
 				}
 				for _, chain := range dpiHooks {
-					dir := "--dport"
 					if chain == "INPUT" {
 						// INPUT ловим по source-порту — только если он не
 						// эфемерный (иначе задели бы клиентов).
 						if !sportSafe(port) {
 							continue
 						}
-						dir = "--sport"
+						if exec.Command(ipt, sportDropArgs("-A", chain, proto, port)...).Run() == nil {
+							count++
+						}
+						continue
 					}
-					if exec.Command(ipt, "-A", chain, "-p", proto, dir, port, "-j", "DROP").Run() == nil {
+					if exec.Command(ipt, dportDropArgs("-A", chain, proto, port)...).Run() == nil {
 						count++
 					}
 				}
@@ -1869,15 +1923,15 @@ func applyPortBlock() int {
 					continue
 				}
 				// --dport безопасен для любых портов: блокируем «хостинг» торрент-порта.
-				if exec.Command(ipt, "-A", "FORWARD", "-p", proto, "--dport", port, "-j", "DROP").Run() == nil {
+				if exec.Command(ipt, dportDropArgs("-A", "FORWARD", proto, port)...).Run() == nil {
 					count++
 				}
 				// --sport только для неэфемерных портов, иначе рискуем клиентами.
 				if sportSafe(port) {
-					if exec.Command(ipt, "-A", "FORWARD", "-p", proto, "--sport", port, "-j", "DROP").Run() == nil {
+					if exec.Command(ipt, sportDropArgs("-A", "FORWARD", proto, port)...).Run() == nil {
 						count++
 					}
-					if exec.Command(ipt, "-A", "INPUT", "-p", proto, "--sport", port, "-j", "DROP").Run() == nil {
+					if exec.Command(ipt, sportDropArgs("-A", "INPUT", proto, port)...).Run() == nil {
 						count++
 					}
 				}

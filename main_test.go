@@ -143,6 +143,29 @@ func TestBridgePortsExcluded(t *testing.T) {
 	}
 }
 
+// Правило по --sport обязано резать только ОТВЕТЫ на соединения сервера
+// (--ctstate ESTABLISHED --ctdir REPLY). Без этого DROP задевал входящих
+// клиентов, которым CGNAT выдал порт 6881-6999/3659/…, и loopback-SYN xray.
+func TestSportDropOnlyReplies(t *testing.T) {
+	got := strings.Join(sportDropArgs("-A", "INPUT", "tcp", "6969"), " ")
+	want := "-A INPUT -p tcp --sport 6969 -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j DROP"
+	if got != want {
+		t.Fatalf("sportDropArgs:\n got  %q\n want %q", got, want)
+	}
+	gotD := strings.Join(dportDropArgs("-A", "OUTPUT", "udp", "6969"), " ")
+	wantD := "-A OUTPUT -p udp --dport 6969 -m conntrack --ctdir ORIGINAL -j DROP"
+	if gotD != wantD {
+		t.Fatalf("dportDropArgs:\n got  %q\n want %q", gotD, wantD)
+	}
+	if strings.Join(legacyDportDropArgs("-D", "FORWARD", "tcp", "6880"), " ") != "-D FORWARD -p tcp --dport 6880 -j DROP" {
+		t.Fatalf("legacyDportDropArgs должен совпадать со старой формой правила")
+	}
+	legacy := strings.Join(legacySportDropArgs("-D", "INPUT", "udp", "6881:6999"), " ")
+	if legacy != "-D INPUT -p udp --sport 6881:6999 -j DROP" {
+		t.Fatalf("legacySportDropArgs должен совпадать со старой формой правила: %q", legacy)
+	}
+}
+
 func portRange(p string) (int, int) {
 	if i := strings.IndexByte(p, ':'); i >= 0 {
 		lo, _ := strconv.Atoi(p[:i])
