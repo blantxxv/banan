@@ -1394,7 +1394,7 @@ func fanoutObserveAt(clientIP, email, dest, tag string, at, now time.Time) fanou
 		fanoutSrc[clientIP][email] = now
 	}
 	proto, ip, port := fanoutPeer(dest)
-	if ip == "" {
+	if ip == "" || isNotTorrentDst(net.JoinHostPort(ip, port)) {
 		return fanoutVerdict{}
 	}
 	key := email
@@ -1663,6 +1663,11 @@ func monitorLog(path string) {
 
 		if clientIP != "" && email != "" {
 			fanoutObserve(clientIP, email, "", torrentTag, time.Now()) // только учёт источника
+		}
+		if destAddr != "" && isNotTorrentDst(destAddr) {
+			// сервис из списка «не торрент»: сниффер ошибается, не баним и пира не заносим
+			log.Printf("NOT_TORRENT %s user=%s dst=%s — назначение из списка, не баню", clientIP, email, destAddr)
+			continue
 		}
 		if _, _, weak := weakUDPTag(destAddr); weak {
 			// UDP вне BT-портов: uTP-сниффер xray ошибается на игровых пакетах.
@@ -2385,6 +2390,7 @@ func main() {
 	// разбор логов могли бы задеть свою инфраструктуру.
 	addLocalIPs()
 	loadBypassFile(bypassFile)
+	loadNotTorrentFile(notTorrentFile)
 	loadProtectedUsers(protectedUsersFile)
 	bindLogsToContainers()
 
@@ -2424,6 +2430,7 @@ func main() {
 				// перечитать белый список без перезапуска (добавили мост/релей)
 				loadBypassFile(bypassFile)
 				loadProtectedUsers(protectedUsersFile)
+				loadNotTorrentFile(notTorrentFile)
 				continue
 			}
 			// Остановленный блокер не должен держать юзеров вне инбаундов:
